@@ -5,6 +5,15 @@ const axios = require('axios');
 const app = express();
 app.use(express.json());
 
+// CORS
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
+
 const CLICKSEND_USERNAME = process.env.CLICKSEND_USERNAME;
 const CLICKSEND_API_KEY = process.env.CLICKSEND_API_KEY;
 
