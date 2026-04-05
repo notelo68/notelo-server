@@ -1,22 +1,318 @@
 require('dotenv').config();
-const express = require('express');
-const axios   = require('axios');
-const fs      = require('fs');
-const path    = require('path');
+const express  = require('express');
+const axios    = require('axios');
+const fs       = require('fs');
+const path     = require('path');
+const crypto   = require('crypto');
+const Stripe   = require('stripe');
+const nodemailer = require('nodemailer');
 
-const app = express();
+const app    = express();
+const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
+
+// ─── EMAIL TRANSPORTER ───────────────────────────────────────────────────────
+const transporter = nodemailer.createTransport({
+  service: 'gmail',
+  auth: {
+    user: process.env.EMAIL_USER,
+    pass: process.env.EMAIL_PASS   // Mot de passe d'application Gmail (pas le vrai mdp)
+  }
+});
+
+// ─── STRIPE WEBHOOK — doit être AVANT express.json() ─────────────────────────
+// Stripe a besoin du body brut pour vérifier la signature
+app.post(
+  '/webhook/stripe',
+  express.raw({ type: 'application/json' }),
+  async (req, res) => {
+    const sig    = req.headers['stripe-signature'];
+    const secret = process.env.STRIPE_WEBHOOK_SECRET;
+
+    let event;
+    try {
+      event = stripe.webhooks.constructEvent(req.body, sig, secret);
+    } catch (err) {
+      console.error(`⚠️  Webhook signature invalide : ${err.message}`);
+      return res.status(400).send(`Webhook Error: ${err.message}`);
+    }
+
+    // ── Paiement / abonnement confirmé ──────────────────────────────────────
+    if (event.type === 'checkout.session.completed') {
+      const session = event.data.object;
+      await handleCheckoutCompleted(session);
+    }
+
+    // ── Abonnement annulé (ex. depuis le portail client Stripe) ─────────────
+    if (event.type === 'customer.subscription.deleted') {
+      const subscription = event.data.object;
+      handleSubscriptionDeleted(subscription);
+    }
+
+    // ── Renouvellement réussi ────────────────────────────────────────────────
+    if (event.type === 'invoice.payment_succeeded') {
+      const invoice = event.data.object;
+      handleInvoicePaymentSucceeded(invoice);
+    }
+
+    return res.json({ received: true });
+  }
+);
+
+// ─── MIDDLEWARES GLOBAUX ──────────────────────────────────────────────────────
 app.use(express.json());
+
+// ─── MODE MAINTENANCE ─────────────────────────────────────────────────────────
+// Active via MAINTENANCE_MODE=true dans .env
+// Le webhook Stripe reste accessible pour traiter les paiements déjà en cours.
+if (process.env.MAINTENANCE_MODE === 'true') {
+  app.use((req, res, next) => {
+    // On laisse passer le webhook Stripe (déjà enregistré avant ce middleware)
+    res.status(503).set('Retry-After', '3600').send(`
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Maintenance — Notelo</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: #f5f3ff;
+      display: flex; align-items: center; justify-content: center;
+      min-height: 100vh; padding: 24px;
+    }
+    .card {
+      background: #fff; border-radius: 16px; padding: 48px 40px;
+      max-width: 480px; width: 100%; text-align: center;
+      box-shadow: 0 4px 24px rgba(124,58,237,.12);
+    }
+    .icon { font-size: 48px; margin-bottom: 16px; }
+    h1 { color: #7c3aed; font-size: 24px; margin-bottom: 12px; }
+    p  { color: #6b7280; line-height: 1.6; margin-bottom: 8px; }
+    a  { color: #7c3aed; text-decoration: none; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="icon">🔧</div>
+    <h1>Maintenance en cours</h1>
+    <p>Notelo est temporairement indisponible pour des opérations de maintenance.</p>
+    <p>Nous serons de retour très bientôt. Merci pour votre patience !</p>
+    <p style="margin-top:24px;font-size:13px;">
+      Besoin d'aide ? <a href="mailto:${process.env.EMAIL_USER || 'contact@notelo.fr'}">Contactez-nous</a>
+    </p>
+  </div>
+</body>
+</html>`);
+  });
+}
 
 // CORS
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
 
-// ─── PERSISTANCE LIENS RACCOURCIS ───
+// ─── PERSISTANCE UTILISATEURS ────────────────────────────────────────────────
+const USERS_FILE = path.join(__dirname, 'users.json');
+
+function readUsers() {
+  try {
+    if (!fs.existsSync(USERS_FILE)) return {};
+    return JSON.parse(fs.readFileSync(USERS_FILE, 'utf8'));
+  } catch (e) { return {}; }
+}
+
+function writeUsers(users) {
+  fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 2), 'utf8');
+}
+
+function hashPassword(password) {
+  const salt = crypto.randomBytes(16).toString('hex');
+  const hash = crypto.scryptSync(password, salt, 64).toString('hex');
+  return `${salt}:${hash}`;
+}
+
+function generatePassword(length = 12) {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789!@#$%';
+  let pwd = '';
+  const bytes = crypto.randomBytes(length);
+  for (let i = 0; i < length; i++) {
+    pwd += chars[bytes[i] % chars.length];
+  }
+  return pwd;
+}
+
+// ─── LOGIQUE WEBHOOK ─────────────────────────────────────────────────────────
+
+async function handleCheckoutCompleted(session) {
+  const email = session.customer_details?.email || session.customer_email;
+  if (!email) {
+    console.error('❌ checkout.session.completed : aucun email trouvé dans la session.');
+    return;
+  }
+
+  const users = readUsers();
+
+  // Si l'utilisateur existe déjà (ex. renouvellement manuel), on ne re-crée pas
+  if (users[email] && users[email].subscriptionStatus === 'active') {
+    console.log(`ℹ️  Utilisateur ${email} déjà actif.`);
+    return;
+  }
+
+  const password          = generatePassword();
+  const passwordHash      = hashPassword(password);
+  const stripeCustomerId  = session.customer;
+  const stripeSubId       = session.subscription;
+
+  users[email] = {
+    email,
+    passwordHash,
+    stripeCustomerId,
+    stripeSubscriptionId: stripeSubId,
+    subscriptionStatus: 'active',
+    createdAt: new Date().toISOString()
+  };
+  writeUsers(users);
+
+  console.log(`✅ Nouvel abonné créé : ${email}`);
+
+  // Génère un lien vers le portail client Stripe pour gérer / annuler l'abonnement
+  let portalUrl = null;
+  try {
+    if (stripeCustomerId) {
+      const portalSession = await stripe.billingPortal.sessions.create({
+        customer:   stripeCustomerId,
+        return_url: process.env.DASHBOARD_URL || 'https://notelo.fr/dashboard'
+      });
+      portalUrl = portalSession.url;
+    }
+  } catch (err) {
+    console.warn('⚠️  Impossible de générer le lien portail Stripe :', err.message);
+  }
+
+  await sendWelcomeEmail({ email, password, portalUrl });
+}
+
+function handleSubscriptionDeleted(subscription) {
+  const users = readUsers();
+  const user  = Object.values(users).find(
+    u => u.stripeSubscriptionId === subscription.id
+  );
+  if (user) {
+    user.subscriptionStatus = 'cancelled';
+    writeUsers(users);
+    console.log(`🚫 Abonnement annulé pour ${user.email}`);
+  }
+}
+
+function handleInvoicePaymentSucceeded(invoice) {
+  if (invoice.billing_reason === 'subscription_create') return; // déjà géré au-dessus
+  const users = readUsers();
+  const user  = Object.values(users).find(
+    u => u.stripeCustomerId === invoice.customer
+  );
+  if (user && user.subscriptionStatus !== 'active') {
+    user.subscriptionStatus = 'active';
+    writeUsers(users);
+    console.log(`🔄 Abonnement réactivé pour ${user.email}`);
+  }
+}
+
+// ─── ENVOI D'EMAIL ────────────────────────────────────────────────────────────
+
+async function sendWelcomeEmail({ email, password, portalUrl }) {
+  const dashboardUrl = process.env.DASHBOARD_URL || 'https://notelo.fr/dashboard';
+  const loginUrl     = process.env.LOGIN_URL     || 'https://notelo.fr/login';
+
+  const cancelSection = portalUrl
+    ? `<p>Pour gérer ou <strong>annuler votre abonnement</strong>, cliquez ici :<br>
+       <a href="${portalUrl}" style="color:#ef4444;">Gérer mon abonnement</a></p>`
+    : `<p>Pour annuler votre abonnement, contactez-nous à <a href="mailto:${process.env.EMAIL_USER}">${process.env.EMAIL_USER}</a>.</p>`;
+
+  const html = `
+  <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:24px;">
+    <h1 style="color:#7c3aed;">Bienvenue sur Notelo 🎉</h1>
+    <p>Votre abonnement est actif. Voici vos identifiants de connexion :</p>
+
+    <div style="background:#f5f3ff;border-left:4px solid #7c3aed;padding:16px;border-radius:8px;margin:24px 0;">
+      <p style="margin:4px 0;"><strong>Email :</strong> ${email}</p>
+      <p style="margin:4px 0;"><strong>Mot de passe :</strong> <code style="background:#e5e7eb;padding:2px 6px;border-radius:4px;">${password}</code></p>
+    </div>
+
+    <p>
+      <a href="${loginUrl}"
+         style="background:#7c3aed;color:#fff;padding:12px 24px;border-radius:8px;text-decoration:none;display:inline-block;">
+        Accéder à mon Dashboard
+      </a>
+    </p>
+
+    <p style="margin-top:32px;font-size:13px;color:#6b7280;">
+      Pour des raisons de sécurité, changez votre mot de passe dès votre première connexion.
+    </p>
+
+    ${cancelSection}
+
+    <hr style="margin-top:32px;border:none;border-top:1px solid #e5e7eb;">
+    <p style="font-size:12px;color:#9ca3af;">Équipe Notelo — <a href="https://notelo.fr">notelo.fr</a></p>
+  </div>`;
+
+  try {
+    await transporter.sendMail({
+      from:    `"Notelo" <${process.env.EMAIL_USER}>`,
+      to:      email,
+      subject: '🎉 Vos identifiants Notelo',
+      html
+    });
+    console.log(`📧 Email envoyé à ${email}`);
+  } catch (err) {
+    console.error(`❌ Erreur envoi email à ${email} :`, err.message);
+  }
+}
+
+// ─── POST /cancel-subscription ───────────────────────────────────────────────
+// L'utilisateur envoie son email → on lui renvoie le lien Stripe Customer Portal
+app.post('/cancel-subscription', async (req, res) => {
+  const { email } = req.body;
+  if (!email) {
+    return res.status(400).json({ success: false, error: 'Email requis.' });
+  }
+
+  const users = readUsers();
+  const user  = users[email?.toLowerCase().trim()];
+
+  if (!user) {
+    return res.status(404).json({ success: false, error: 'Aucun abonnement trouvé pour cet email.' });
+  }
+
+  if (!user.stripeCustomerId) {
+    return res.status(400).json({ success: false, error: 'Aucun client Stripe associé.' });
+  }
+
+  try {
+    const portalSession = await stripe.billingPortal.sessions.create({
+      customer:   user.stripeCustomerId,
+      return_url: process.env.DASHBOARD_URL || 'https://notelo.fr/dashboard'
+    });
+    return res.json({ success: true, url: portalSession.url });
+  } catch (err) {
+    console.error('Erreur portail Stripe :', err.message);
+    return res.status(500).json({ success: false, error: 'Impossible de générer le lien de gestion.' });
+  }
+});
+
+// ─── GET /payment-success ─────────────────────────────────────────────────────
+// URL de redirection après paiement Stripe (success_url)
+app.get('/payment-success', (req, res) => {
+  const loginUrl = process.env.LOGIN_URL || 'https://notelo.fr/login';
+  res.redirect(302, loginUrl);
+});
+
+// ─── PERSISTANCE LIENS RACCOURCIS ────────────────────────────────────────────
 const LINKS_FILE = path.join(__dirname, 'links.json');
 
 function readLinks() {
@@ -37,17 +333,15 @@ function generateCode() {
   return code;
 }
 
-// POST /shorten — raccourcit une URL
 app.post('/shorten', (req, res) => {
   const { url } = req.body;
   if (!url || !url.startsWith('http')) {
     return res.status(400).json({ success: false, error: 'URL invalide' });
   }
 
-  const links = readLinks();
+  const links   = readLinks();
   const BASE_URL = process.env.BASE_URL || 'https://notelo-server.onrender.com';
 
-  // Réutiliser un code existant si l'URL est déjà connue
   const existing = Object.entries(links).find(([, data]) => data.url === url);
   if (existing) {
     return res.json({ success: true, short: `${BASE_URL}/r/${existing[0]}` });
@@ -63,24 +357,21 @@ app.post('/shorten', (req, res) => {
   return res.status(201).json({ success: true, short: `${BASE_URL}/r/${code}` });
 });
 
-// GET /r/:code — redirection vers l'URL originale
 app.get('/r/:code', (req, res) => {
   const links = readLinks();
-  const data = links[req.params.code];
+  const data  = links[req.params.code];
   if (!data) return res.status(404).send('Lien introuvable ou expiré.');
   return res.redirect(301, data.url);
 });
 
-// ─── PERSISTANCE MESSAGES (fichier JSON local) ───
+// ─── MESSAGES ─────────────────────────────────────────────────────────────────
 const MESSAGES_FILE = path.join(__dirname, 'messages.json');
 
 function readMessages() {
   try {
     if (!fs.existsSync(MESSAGES_FILE)) return [];
     return JSON.parse(fs.readFileSync(MESSAGES_FILE, 'utf8'));
-  } catch (e) {
-    return [];
-  }
+  } catch (e) { return []; }
 }
 
 function writeMessages(messages) {
@@ -88,7 +379,7 @@ function writeMessages(messages) {
 }
 
 const CLICKSEND_USERNAME = process.env.CLICKSEND_USERNAME;
-const CLICKSEND_API_KEY = process.env.CLICKSEND_API_KEY;
+const CLICKSEND_API_KEY  = process.env.CLICKSEND_API_KEY;
 
 app.post('/send-sms', async (req, res) => {
   const { prenom, telephone, nomPro, lienGoogle } = req.body;
@@ -105,53 +396,26 @@ app.post('/send-sms', async (req, res) => {
   try {
     const response = await axios.post(
       'https://rest.clicksend.com/v3/sms/send',
+      { messages: [{ to: telephone, body: message, source: 'nodejs' }] },
       {
-        messages: [
-          {
-            to: telephone,
-            body: message,
-            source: 'nodejs'
-          }
-        ]
-      },
-      {
-        auth: {
-          username: CLICKSEND_USERNAME,
-          password: CLICKSEND_API_KEY
-        },
-        headers: {
-          'Content-Type': 'application/json'
-        }
+        auth:    { username: CLICKSEND_USERNAME, password: CLICKSEND_API_KEY },
+        headers: { 'Content-Type': 'application/json' }
       }
     );
 
     const messageData = response.data?.data?.messages?.[0];
-    const status = messageData?.status;
+    const status      = messageData?.status;
 
     if (status === 'SUCCESS') {
-      return res.status(200).json({
-        success: true,
-        message: 'SMS envoyé avec succès.',
-        details: messageData
-      });
+      return res.status(200).json({ success: true, message: 'SMS envoyé avec succès.', details: messageData });
     } else {
-      return res.status(502).json({
-        success: false,
-        error: 'ClickSend a retourné un statut inattendu.',
-        details: messageData
-      });
+      return res.status(502).json({ success: false, error: 'ClickSend a retourné un statut inattendu.', details: messageData });
     }
   } catch (err) {
-    const clicksendError = err.response?.data;
-    return res.status(500).json({
-      success: false,
-      error: 'Erreur lors de l\'envoi du SMS.',
-      details: clicksendError || err.message
-    });
+    return res.status(500).json({ success: false, error: "Erreur lors de l'envoi du SMS.", details: err.response?.data || err.message });
   }
 });
 
-// ─── POST /messages — client envoie un message ───
 app.post('/messages', (req, res) => {
   const { from, fromName, fromBusiness, subject, content, timestamp } = req.body;
 
@@ -171,23 +435,21 @@ app.post('/messages', (req, res) => {
   };
 
   const messages = readMessages();
-  messages.unshift(message);           // plus récent en premier
+  messages.unshift(message);
   writeMessages(messages);
 
   console.log(`📩 Nouveau message de ${message.fromName} (${message.from}) — "${message.subject}"`);
   return res.status(201).json({ success: true, id: message.id });
 });
 
-// ─── GET /messages?admin=1 — admin récupère tous les messages ───
 app.get('/messages', (req, res) => {
   if (req.query.admin !== '1') {
     return res.status(403).json({ success: false, error: 'Accès refusé.' });
   }
-
-  const messages = readMessages();
-  return res.status(200).json(messages);
+  return res.status(200).json(readMessages());
 });
 
+// ─── START ────────────────────────────────────────────────────────────────────
 app.listen(3000, () => {
-  console.log('Serveur démarré sur le port 3000');
+  console.log('🚀 Serveur démarré sur le port 3000');
 });
