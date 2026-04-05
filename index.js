@@ -29,7 +29,8 @@ function getTransporter() {
 }
 
 // ─── PERSISTANCE UTILISATEURS ────────────────────────────────────────────────
-const USERS_FILE = path.join(__dirname, 'users.json');
+const USERS_FILE         = path.join(__dirname, 'users.json');
+const PENDING_EMAILS_FILE = path.join(__dirname, 'pending-emails.json');
 
 function readUsers() {
   try {
@@ -40,6 +41,19 @@ function readUsers() {
 
 function writeUsers(users) {
   fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 2), 'utf8');
+}
+
+// Sauvegarde les identifiants en local si l'email ne part pas (rien n'est perdu)
+function savePendingEmail({ email, password, portalUrl, reason }) {
+  let pending = [];
+  try {
+    if (fs.existsSync(PENDING_EMAILS_FILE)) {
+      pending = JSON.parse(fs.readFileSync(PENDING_EMAILS_FILE, 'utf8'));
+    }
+  } catch (e) { /* ignore */ }
+  pending.push({ email, password, portalUrl, reason, savedAt: new Date().toISOString() });
+  fs.writeFileSync(PENDING_EMAILS_FILE, JSON.stringify(pending, null, 2), 'utf8');
+  console.log(`💾 Identifiants sauvegardés localement pour ${email} (email non envoyé : ${reason})`);
 }
 
 function hashPassword(password) {
@@ -97,8 +111,10 @@ async function sendWelcomeEmail({ email, password, portalUrl }) {
   </div>`;
 
   if (!transporter) {
-    console.warn(`⚠️  Email non envoyé à ${email} : EMAIL_USER / EMAIL_PASS non configurés.`);
-    return { sent: false, reason: 'Email non configuré' };
+    const reason = 'EMAIL_USER / EMAIL_PASS non configurés';
+    console.warn(`⚠️  Email non envoyé à ${email} : ${reason}`);
+    savePendingEmail({ email, password, portalUrl, reason });
+    return { sent: false, reason };
   }
 
   try {
@@ -112,6 +128,7 @@ async function sendWelcomeEmail({ email, password, portalUrl }) {
     return { sent: true };
   } catch (err) {
     console.error(`❌ Erreur envoi email à ${email} :`, err.message);
+    savePendingEmail({ email, password, portalUrl, reason: err.message });
     return { sent: false, reason: err.message };
   }
 }
@@ -281,6 +298,44 @@ app.post('/admin/send-welcome-email', requireAdmin, async (req, res) => {
   });
 
   res.json({ success: true, email, emailResult: result });
+});
+
+// GET /admin/pending-emails — identifiants en attente (email non envoyé)
+app.get('/admin/pending-emails', requireAdmin, (req, res) => {
+  try {
+    if (!fs.existsSync(PENDING_EMAILS_FILE)) return res.json({ success: true, count: 0, pending: [] });
+    const pending = JSON.parse(fs.readFileSync(PENDING_EMAILS_FILE, 'utf8'));
+    res.json({ success: true, count: pending.length, pending });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// POST /admin/retry-pending-emails — renvoie tous les emails en attente
+app.post('/admin/retry-pending-emails', requireAdmin, async (req, res) => {
+  try {
+    if (!fs.existsSync(PENDING_EMAILS_FILE)) return res.json({ success: true, message: 'Aucun email en attente.' });
+    const pending = JSON.parse(fs.readFileSync(PENDING_EMAILS_FILE, 'utf8'));
+    if (pending.length === 0) return res.json({ success: true, message: 'Aucun email en attente.' });
+
+    const results = [];
+    const remaining = [];
+
+    for (const entry of pending) {
+      const result = await sendWelcomeEmail({
+        email:     entry.email,
+        password:  entry.password,
+        portalUrl: entry.portalUrl
+      });
+      results.push({ email: entry.email, ...result });
+      if (!result.sent) remaining.push(entry); // garde ceux qui ont encore échoué
+    }
+
+    fs.writeFileSync(PENDING_EMAILS_FILE, JSON.stringify(remaining, null, 2), 'utf8');
+    res.json({ success: true, results, stillPending: remaining.length });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
 });
 
 // POST /admin/maintenance — active/désactive la maintenance à chaud
