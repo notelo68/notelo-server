@@ -1,26 +1,197 @@
 require('dotenv').config();
-const express  = require('express');
-const axios    = require('axios');
-const fs       = require('fs');
-const path     = require('path');
-const crypto   = require('crypto');
-const Stripe   = require('stripe');
+const express    = require('express');
+const axios      = require('axios');
+const fs         = require('fs');
+const path       = require('path');
+const crypto     = require('crypto');
+const Stripe     = require('stripe');
 const nodemailer = require('nodemailer');
 
-const app    = express();
-const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
+const app = express();
+
+// ─── STRIPE (lazy init — ne crashe pas si la clé manque) ─────────────────────
+function getStripe() {
+  if (!process.env.STRIPE_SECRET_KEY || process.env.STRIPE_SECRET_KEY === 'sk_test_REMPLACER') {
+    return null;
+  }
+  return Stripe(process.env.STRIPE_SECRET_KEY);
+}
 
 // ─── EMAIL TRANSPORTER ───────────────────────────────────────────────────────
-const transporter = nodemailer.createTransport({
-  service: 'gmail',
-  auth: {
-    user: process.env.EMAIL_USER,
-    pass: process.env.EMAIL_PASS   // Mot de passe d'application Gmail (pas le vrai mdp)
+function getTransporter() {
+  if (!process.env.EMAIL_USER || !process.env.EMAIL_PASS || process.env.EMAIL_PASS === 'REMPLACER') {
+    return null;
   }
-});
+  return nodemailer.createTransport({
+    service: 'gmail',
+    auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_PASS }
+  });
+}
 
-// ─── STRIPE WEBHOOK — doit être AVANT express.json() ─────────────────────────
-// Stripe a besoin du body brut pour vérifier la signature
+// ─── PERSISTANCE UTILISATEURS ────────────────────────────────────────────────
+const USERS_FILE = path.join(__dirname, 'users.json');
+
+function readUsers() {
+  try {
+    if (!fs.existsSync(USERS_FILE)) return {};
+    return JSON.parse(fs.readFileSync(USERS_FILE, 'utf8'));
+  } catch (e) { return {}; }
+}
+
+function writeUsers(users) {
+  fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 2), 'utf8');
+}
+
+function hashPassword(password) {
+  const salt = crypto.randomBytes(16).toString('hex');
+  const hash = crypto.scryptSync(password, salt, 64).toString('hex');
+  return `${salt}:${hash}`;
+}
+
+function generatePassword(length = 12) {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789!@#$%';
+  let pwd = '';
+  const bytes = crypto.randomBytes(length);
+  for (let i = 0; i < length; i++) pwd += chars[bytes[i] % chars.length];
+  return pwd;
+}
+
+// ─── ENVOI D'EMAIL ────────────────────────────────────────────────────────────
+async function sendWelcomeEmail({ email, password, portalUrl }) {
+  const transporter  = getTransporter();
+  const dashboardUrl = process.env.DASHBOARD_URL || 'https://notelo.fr/dashboard';
+  const loginUrl     = process.env.LOGIN_URL     || 'https://notelo.fr/login';
+
+  const cancelSection = portalUrl
+    ? `<p>Pour gérer ou <strong>annuler votre abonnement</strong>, cliquez ici :<br>
+       <a href="${portalUrl}" style="color:#ef4444;">Gérer mon abonnement</a></p>`
+    : `<p>Pour annuler votre abonnement, contactez-nous à <a href="mailto:${process.env.EMAIL_USER || 'contact@notelo.fr'}">${process.env.EMAIL_USER || 'contact@notelo.fr'}</a>.</p>`;
+
+  const html = `
+  <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:24px;">
+    <h1 style="color:#7c3aed;">Bienvenue sur Notelo !</h1>
+    <p>Votre abonnement est actif. Voici vos identifiants de connexion :</p>
+
+    <div style="background:#f5f3ff;border-left:4px solid #7c3aed;padding:16px;border-radius:8px;margin:24px 0;">
+      <p style="margin:4px 0;"><strong>Email :</strong> ${email}</p>
+      <p style="margin:4px 0;"><strong>Mot de passe :</strong>
+        <code style="background:#e5e7eb;padding:2px 6px;border-radius:4px;">${password}</code>
+      </p>
+    </div>
+
+    <p>
+      <a href="${loginUrl}"
+         style="background:#7c3aed;color:#fff;padding:12px 24px;border-radius:8px;text-decoration:none;display:inline-block;">
+        Accéder à mon Dashboard
+      </a>
+    </p>
+
+    <p style="margin-top:32px;font-size:13px;color:#6b7280;">
+      Pour des raisons de sécurité, changez votre mot de passe dès votre première connexion.
+    </p>
+
+    ${cancelSection}
+
+    <hr style="margin-top:32px;border:none;border-top:1px solid #e5e7eb;">
+    <p style="font-size:12px;color:#9ca3af;">Équipe Notelo — <a href="https://notelo.fr">notelo.fr</a></p>
+  </div>`;
+
+  if (!transporter) {
+    console.warn(`⚠️  Email non envoyé à ${email} : EMAIL_USER / EMAIL_PASS non configurés.`);
+    return { sent: false, reason: 'Email non configuré' };
+  }
+
+  try {
+    await transporter.sendMail({
+      from:    `"Notelo" <${process.env.EMAIL_USER}>`,
+      to:      email,
+      subject: 'Vos identifiants Notelo',
+      html
+    });
+    console.log(`📧 Email envoyé à ${email}`);
+    return { sent: true };
+  } catch (err) {
+    console.error(`❌ Erreur envoi email à ${email} :`, err.message);
+    return { sent: false, reason: err.message };
+  }
+}
+
+// ─── LOGIQUE WEBHOOK ─────────────────────────────────────────────────────────
+async function createUserAndSendEmail({ email, stripeCustomerId, stripeSubId }) {
+  const users    = readUsers();
+  const password = generatePassword();
+
+  users[email] = {
+    email,
+    passwordHash:         hashPassword(password),
+    stripeCustomerId:     stripeCustomerId || null,
+    stripeSubscriptionId: stripeSubId      || null,
+    subscriptionStatus:   'active',
+    createdAt:            new Date().toISOString()
+  };
+  writeUsers(users);
+  console.log(`✅ Utilisateur créé : ${email}`);
+
+  // Lien portail Stripe pour gérer/annuler
+  let portalUrl = null;
+  const stripe = getStripe();
+  if (stripe && stripeCustomerId) {
+    try {
+      const portalSession = await stripe.billingPortal.sessions.create({
+        customer:   stripeCustomerId,
+        return_url: process.env.DASHBOARD_URL || 'https://notelo.fr/dashboard'
+      });
+      portalUrl = portalSession.url;
+    } catch (err) {
+      console.warn('⚠️  Portail Stripe indisponible :', err.message);
+    }
+  }
+
+  return sendWelcomeEmail({ email, password, portalUrl });
+}
+
+async function handleCheckoutCompleted(session) {
+  const email = session.customer_details?.email || session.customer_email;
+  if (!email) {
+    console.error('❌ checkout.session.completed : aucun email trouvé.');
+    return;
+  }
+
+  const users = readUsers();
+  if (users[email]?.subscriptionStatus === 'active') {
+    console.log(`ℹ️  ${email} est déjà actif.`);
+    return;
+  }
+
+  await createUserAndSendEmail({
+    email,
+    stripeCustomerId: session.customer,
+    stripeSubId:      session.subscription
+  });
+}
+
+function handleSubscriptionDeleted(subscription) {
+  const users = readUsers();
+  const user  = Object.values(users).find(u => u.stripeSubscriptionId === subscription.id);
+  if (user) {
+    user.subscriptionStatus = 'cancelled';
+    writeUsers(users);
+    console.log(`🚫 Abonnement annulé pour ${user.email}`);
+  }
+}
+
+function handleInvoicePaymentSucceeded(invoice) {
+  if (invoice.billing_reason === 'subscription_create') return;
+  const users = readUsers();
+  const user  = Object.values(users).find(u => u.stripeCustomerId === invoice.customer);
+  if (user && user.subscriptionStatus !== 'active') {
+    user.subscriptionStatus = 'active';
+    writeUsers(users);
+    console.log(`🔄 Abonnement réactivé pour ${user.email}`);
+  }
+}
+
+// ─── STRIPE WEBHOOK — AVANT express.json() ───────────────────────────────────
 app.post(
   '/webhook/stripe',
   express.raw({ type: 'application/json' }),
@@ -28,31 +199,22 @@ app.post(
     const sig    = req.headers['stripe-signature'];
     const secret = process.env.STRIPE_WEBHOOK_SECRET;
 
+    if (!secret || secret === 'whsec_REMPLACER') {
+      console.error('❌ STRIPE_WEBHOOK_SECRET non configuré.');
+      return res.status(500).send('Webhook secret manquant.');
+    }
+
     let event;
     try {
-      event = stripe.webhooks.constructEvent(req.body, sig, secret);
+      event = Stripe(process.env.STRIPE_SECRET_KEY).webhooks.constructEvent(req.body, sig, secret);
     } catch (err) {
       console.error(`⚠️  Webhook signature invalide : ${err.message}`);
       return res.status(400).send(`Webhook Error: ${err.message}`);
     }
 
-    // ── Paiement / abonnement confirmé ──────────────────────────────────────
-    if (event.type === 'checkout.session.completed') {
-      const session = event.data.object;
-      await handleCheckoutCompleted(session);
-    }
-
-    // ── Abonnement annulé (ex. depuis le portail client Stripe) ─────────────
-    if (event.type === 'customer.subscription.deleted') {
-      const subscription = event.data.object;
-      handleSubscriptionDeleted(subscription);
-    }
-
-    // ── Renouvellement réussi ────────────────────────────────────────────────
-    if (event.type === 'invoice.payment_succeeded') {
-      const invoice = event.data.object;
-      handleInvoicePaymentSucceeded(invoice);
-    }
+    if (event.type === 'checkout.session.completed')    await handleCheckoutCompleted(event.data.object);
+    if (event.type === 'customer.subscription.deleted')       handleSubscriptionDeleted(event.data.object);
+    if (event.type === 'invoice.payment_succeeded')           handleInvoicePaymentSucceeded(event.data.object);
 
     return res.json({ received: true });
   }
@@ -61,13 +223,79 @@ app.post(
 // ─── MIDDLEWARES GLOBAUX ──────────────────────────────────────────────────────
 app.use(express.json());
 
-// ─── MODE MAINTENANCE ─────────────────────────────────────────────────────────
-// Active via MAINTENANCE_MODE=true dans .env
-// Le webhook Stripe reste accessible pour traiter les paiements déjà en cours.
-if (process.env.MAINTENANCE_MODE === 'true') {
-  app.use((req, res, next) => {
-    // On laisse passer le webhook Stripe (déjà enregistré avant ce middleware)
-    res.status(503).set('Retry-After', '3600').send(`
+// ─── MIDDLEWARE AUTH ADMIN ────────────────────────────────────────────────────
+function requireAdmin(req, res, next) {
+  const secret = process.env.ADMIN_SECRET;
+  const token  = req.headers['x-admin-secret'] || req.query.secret;
+  if (!secret || token !== secret) {
+    return res.status(401).json({ success: false, error: 'Non autorisé.' });
+  }
+  next();
+}
+
+// ─── ROUTES ADMIN (exclues de la maintenance) ─────────────────────────────────
+
+// GET /admin/health — vérifie la config
+app.get('/admin/health', requireAdmin, (req, res) => {
+  const stripe      = getStripe();
+  const transporter = getTransporter();
+  const users       = readUsers();
+
+  res.json({
+    status:      'ok',
+    maintenance: process.env.MAINTENANCE_MODE === 'true',
+    stripe: {
+      configured: !!stripe,
+      keyPrefix:  process.env.STRIPE_SECRET_KEY?.slice(0, 8) || 'manquant',
+      webhookSecret: process.env.STRIPE_WEBHOOK_SECRET !== 'whsec_REMPLACER' && !!process.env.STRIPE_WEBHOOK_SECRET
+    },
+    email: {
+      configured: !!transporter,
+      user:       process.env.EMAIL_USER || 'manquant'
+    },
+    users: {
+      total:  Object.keys(users).length,
+      active: Object.values(users).filter(u => u.subscriptionStatus === 'active').length
+    }
+  });
+});
+
+// GET /admin/users — liste des utilisateurs
+app.get('/admin/users', requireAdmin, (req, res) => {
+  const users = readUsers();
+  // Ne renvoie pas les hash de mots de passe
+  const safe = Object.values(users).map(({ passwordHash, ...rest }) => rest);
+  res.json({ success: true, count: safe.length, users: safe });
+});
+
+// POST /admin/send-welcome-email — envoie manuellement les identifiants
+// Usage : { "email": "client@example.com", "stripeCustomerId": "cus_xxx" (optionnel) }
+app.post('/admin/send-welcome-email', requireAdmin, async (req, res) => {
+  const { email, stripeCustomerId } = req.body;
+  if (!email) return res.status(400).json({ success: false, error: 'email requis.' });
+
+  const result = await createUserAndSendEmail({
+    email:            email.toLowerCase().trim(),
+    stripeCustomerId: stripeCustomerId || null,
+    stripeSubId:      null
+  });
+
+  res.json({ success: true, email, emailResult: result });
+});
+
+// POST /admin/maintenance — active/désactive la maintenance à chaud
+app.post('/admin/maintenance', requireAdmin, (req, res) => {
+  const { enabled } = req.body;
+  process.env.MAINTENANCE_MODE = enabled ? 'true' : 'false';
+  console.log(`🔧 Maintenance : ${enabled ? 'activée' : 'désactivée'}`);
+  res.json({ success: true, maintenance: enabled });
+});
+
+// ─── MODE MAINTENANCE (après les routes admin) ────────────────────────────────
+app.use((req, res, next) => {
+  if (process.env.MAINTENANCE_MODE !== 'true') return next();
+
+  res.status(503).set('Retry-After', '3600').send(`
 <!DOCTYPE html>
 <html lang="fr">
 <head>
@@ -100,13 +328,12 @@ if (process.env.MAINTENANCE_MODE === 'true') {
     <p>Notelo est temporairement indisponible pour des opérations de maintenance.</p>
     <p>Nous serons de retour très bientôt. Merci pour votre patience !</p>
     <p style="margin-top:24px;font-size:13px;">
-      Besoin d'aide ? <a href="mailto:${process.env.EMAIL_USER || 'contact@notelo.fr'}">Contactez-nous</a>
+      Besoin d'aide ? <a href="mailto:${process.env.EMAIL_USER || 'contact@notelo.fr'}">${process.env.EMAIL_USER || 'contact@notelo.fr'}</a>
     </p>
   </div>
 </body>
 </html>`);
-  });
-}
+});
 
 // CORS
 app.use((req, res, next) => {
@@ -117,181 +344,19 @@ app.use((req, res, next) => {
   next();
 });
 
-// ─── PERSISTANCE UTILISATEURS ────────────────────────────────────────────────
-const USERS_FILE = path.join(__dirname, 'users.json');
-
-function readUsers() {
-  try {
-    if (!fs.existsSync(USERS_FILE)) return {};
-    return JSON.parse(fs.readFileSync(USERS_FILE, 'utf8'));
-  } catch (e) { return {}; }
-}
-
-function writeUsers(users) {
-  fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 2), 'utf8');
-}
-
-function hashPassword(password) {
-  const salt = crypto.randomBytes(16).toString('hex');
-  const hash = crypto.scryptSync(password, salt, 64).toString('hex');
-  return `${salt}:${hash}`;
-}
-
-function generatePassword(length = 12) {
-  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789!@#$%';
-  let pwd = '';
-  const bytes = crypto.randomBytes(length);
-  for (let i = 0; i < length; i++) {
-    pwd += chars[bytes[i] % chars.length];
-  }
-  return pwd;
-}
-
-// ─── LOGIQUE WEBHOOK ─────────────────────────────────────────────────────────
-
-async function handleCheckoutCompleted(session) {
-  const email = session.customer_details?.email || session.customer_email;
-  if (!email) {
-    console.error('❌ checkout.session.completed : aucun email trouvé dans la session.');
-    return;
-  }
-
-  const users = readUsers();
-
-  // Si l'utilisateur existe déjà (ex. renouvellement manuel), on ne re-crée pas
-  if (users[email] && users[email].subscriptionStatus === 'active') {
-    console.log(`ℹ️  Utilisateur ${email} déjà actif.`);
-    return;
-  }
-
-  const password          = generatePassword();
-  const passwordHash      = hashPassword(password);
-  const stripeCustomerId  = session.customer;
-  const stripeSubId       = session.subscription;
-
-  users[email] = {
-    email,
-    passwordHash,
-    stripeCustomerId,
-    stripeSubscriptionId: stripeSubId,
-    subscriptionStatus: 'active',
-    createdAt: new Date().toISOString()
-  };
-  writeUsers(users);
-
-  console.log(`✅ Nouvel abonné créé : ${email}`);
-
-  // Génère un lien vers le portail client Stripe pour gérer / annuler l'abonnement
-  let portalUrl = null;
-  try {
-    if (stripeCustomerId) {
-      const portalSession = await stripe.billingPortal.sessions.create({
-        customer:   stripeCustomerId,
-        return_url: process.env.DASHBOARD_URL || 'https://notelo.fr/dashboard'
-      });
-      portalUrl = portalSession.url;
-    }
-  } catch (err) {
-    console.warn('⚠️  Impossible de générer le lien portail Stripe :', err.message);
-  }
-
-  await sendWelcomeEmail({ email, password, portalUrl });
-}
-
-function handleSubscriptionDeleted(subscription) {
-  const users = readUsers();
-  const user  = Object.values(users).find(
-    u => u.stripeSubscriptionId === subscription.id
-  );
-  if (user) {
-    user.subscriptionStatus = 'cancelled';
-    writeUsers(users);
-    console.log(`🚫 Abonnement annulé pour ${user.email}`);
-  }
-}
-
-function handleInvoicePaymentSucceeded(invoice) {
-  if (invoice.billing_reason === 'subscription_create') return; // déjà géré au-dessus
-  const users = readUsers();
-  const user  = Object.values(users).find(
-    u => u.stripeCustomerId === invoice.customer
-  );
-  if (user && user.subscriptionStatus !== 'active') {
-    user.subscriptionStatus = 'active';
-    writeUsers(users);
-    console.log(`🔄 Abonnement réactivé pour ${user.email}`);
-  }
-}
-
-// ─── ENVOI D'EMAIL ────────────────────────────────────────────────────────────
-
-async function sendWelcomeEmail({ email, password, portalUrl }) {
-  const dashboardUrl = process.env.DASHBOARD_URL || 'https://notelo.fr/dashboard';
-  const loginUrl     = process.env.LOGIN_URL     || 'https://notelo.fr/login';
-
-  const cancelSection = portalUrl
-    ? `<p>Pour gérer ou <strong>annuler votre abonnement</strong>, cliquez ici :<br>
-       <a href="${portalUrl}" style="color:#ef4444;">Gérer mon abonnement</a></p>`
-    : `<p>Pour annuler votre abonnement, contactez-nous à <a href="mailto:${process.env.EMAIL_USER}">${process.env.EMAIL_USER}</a>.</p>`;
-
-  const html = `
-  <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:24px;">
-    <h1 style="color:#7c3aed;">Bienvenue sur Notelo 🎉</h1>
-    <p>Votre abonnement est actif. Voici vos identifiants de connexion :</p>
-
-    <div style="background:#f5f3ff;border-left:4px solid #7c3aed;padding:16px;border-radius:8px;margin:24px 0;">
-      <p style="margin:4px 0;"><strong>Email :</strong> ${email}</p>
-      <p style="margin:4px 0;"><strong>Mot de passe :</strong> <code style="background:#e5e7eb;padding:2px 6px;border-radius:4px;">${password}</code></p>
-    </div>
-
-    <p>
-      <a href="${loginUrl}"
-         style="background:#7c3aed;color:#fff;padding:12px 24px;border-radius:8px;text-decoration:none;display:inline-block;">
-        Accéder à mon Dashboard
-      </a>
-    </p>
-
-    <p style="margin-top:32px;font-size:13px;color:#6b7280;">
-      Pour des raisons de sécurité, changez votre mot de passe dès votre première connexion.
-    </p>
-
-    ${cancelSection}
-
-    <hr style="margin-top:32px;border:none;border-top:1px solid #e5e7eb;">
-    <p style="font-size:12px;color:#9ca3af;">Équipe Notelo — <a href="https://notelo.fr">notelo.fr</a></p>
-  </div>`;
-
-  try {
-    await transporter.sendMail({
-      from:    `"Notelo" <${process.env.EMAIL_USER}>`,
-      to:      email,
-      subject: '🎉 Vos identifiants Notelo',
-      html
-    });
-    console.log(`📧 Email envoyé à ${email}`);
-  } catch (err) {
-    console.error(`❌ Erreur envoi email à ${email} :`, err.message);
-  }
-}
-
-// ─── POST /cancel-subscription ───────────────────────────────────────────────
-// L'utilisateur envoie son email → on lui renvoie le lien Stripe Customer Portal
+// ─── CANCEL SUBSCRIPTION ─────────────────────────────────────────────────────
 app.post('/cancel-subscription', async (req, res) => {
   const { email } = req.body;
-  if (!email) {
-    return res.status(400).json({ success: false, error: 'Email requis.' });
-  }
+  if (!email) return res.status(400).json({ success: false, error: 'Email requis.' });
 
   const users = readUsers();
   const user  = users[email?.toLowerCase().trim()];
 
-  if (!user) {
-    return res.status(404).json({ success: false, error: 'Aucun abonnement trouvé pour cet email.' });
-  }
+  if (!user) return res.status(404).json({ success: false, error: 'Aucun abonnement trouvé pour cet email.' });
+  if (!user.stripeCustomerId) return res.status(400).json({ success: false, error: 'Aucun client Stripe associé.' });
 
-  if (!user.stripeCustomerId) {
-    return res.status(400).json({ success: false, error: 'Aucun client Stripe associé.' });
-  }
+  const stripe = getStripe();
+  if (!stripe) return res.status(503).json({ success: false, error: 'Stripe non configuré.' });
 
   try {
     const portalSession = await stripe.billingPortal.sessions.create({
@@ -305,14 +370,13 @@ app.post('/cancel-subscription', async (req, res) => {
   }
 });
 
-// ─── GET /payment-success ─────────────────────────────────────────────────────
-// URL de redirection après paiement Stripe (success_url)
+// ─── REDIRECT APRÈS PAIEMENT ──────────────────────────────────────────────────
 app.get('/payment-success', (req, res) => {
   const loginUrl = process.env.LOGIN_URL || 'https://notelo.fr/login';
   res.redirect(302, loginUrl);
 });
 
-// ─── PERSISTANCE LIENS RACCOURCIS ────────────────────────────────────────────
+// ─── LIENS RACCOURCIS ─────────────────────────────────────────────────────────
 const LINKS_FILE = path.join(__dirname, 'links.json');
 
 function readLinks() {
@@ -339,13 +403,10 @@ app.post('/shorten', (req, res) => {
     return res.status(400).json({ success: false, error: 'URL invalide' });
   }
 
-  const links   = readLinks();
+  const links    = readLinks();
   const BASE_URL = process.env.BASE_URL || 'https://notelo-server.onrender.com';
-
   const existing = Object.entries(links).find(([, data]) => data.url === url);
-  if (existing) {
-    return res.json({ success: true, short: `${BASE_URL}/r/${existing[0]}` });
-  }
+  if (existing) return res.json({ success: true, short: `${BASE_URL}/r/${existing[0]}` });
 
   let code;
   do { code = generateCode(); } while (links[code]);
@@ -378,39 +439,27 @@ function writeMessages(messages) {
   fs.writeFileSync(MESSAGES_FILE, JSON.stringify(messages, null, 2), 'utf8');
 }
 
-const CLICKSEND_USERNAME = process.env.CLICKSEND_USERNAME;
-const CLICKSEND_API_KEY  = process.env.CLICKSEND_API_KEY;
-
 app.post('/send-sms', async (req, res) => {
   const { prenom, telephone, nomPro, lienGoogle } = req.body;
-
   if (!prenom || !telephone || !nomPro || !lienGoogle) {
-    return res.status(400).json({
-      success: false,
-      error: 'Champs manquants : prenom, telephone, nomPro, lienGoogle sont requis.'
-    });
+    return res.status(400).json({ success: false, error: 'Champs manquants : prenom, telephone, nomPro, lienGoogle requis.' });
   }
 
   const message = `Bonjour ${prenom}, merci pour votre visite chez ${nomPro} ! Pouvez-vous nous laisser un avis Google ? ${lienGoogle} - STOP SMS`;
-
   try {
     const response = await axios.post(
       'https://rest.clicksend.com/v3/sms/send',
       { messages: [{ to: telephone, body: message, source: 'nodejs' }] },
       {
-        auth:    { username: CLICKSEND_USERNAME, password: CLICKSEND_API_KEY },
+        auth:    { username: process.env.CLICKSEND_USERNAME, password: process.env.CLICKSEND_API_KEY },
         headers: { 'Content-Type': 'application/json' }
       }
     );
-
     const messageData = response.data?.data?.messages?.[0];
-    const status      = messageData?.status;
-
-    if (status === 'SUCCESS') {
+    if (messageData?.status === 'SUCCESS') {
       return res.status(200).json({ success: true, message: 'SMS envoyé avec succès.', details: messageData });
-    } else {
-      return res.status(502).json({ success: false, error: 'ClickSend a retourné un statut inattendu.', details: messageData });
     }
+    return res.status(502).json({ success: false, error: 'ClickSend a retourné un statut inattendu.', details: messageData });
   } catch (err) {
     return res.status(500).json({ success: false, error: "Erreur lors de l'envoi du SMS.", details: err.response?.data || err.message });
   }
@@ -418,38 +467,30 @@ app.post('/send-sms', async (req, res) => {
 
 app.post('/messages', (req, res) => {
   const { from, fromName, fromBusiness, subject, content, timestamp } = req.body;
-
   if (!from || !subject || !content) {
     return res.status(400).json({ success: false, error: 'Champs manquants : from, subject, content requis.' });
   }
-
   const message = {
-    id:           Date.now().toString(),
-    from:         from.toLowerCase().trim(),
-    fromName:     fromName     || from,
-    fromBusiness: fromBusiness || '',
-    subject:      subject.trim(),
-    content:      content.trim(),
-    timestamp:    timestamp || new Date().toISOString(),
-    receivedAt:   new Date().toISOString()
+    id: Date.now().toString(), from: from.toLowerCase().trim(),
+    fromName: fromName || from, fromBusiness: fromBusiness || '',
+    subject: subject.trim(), content: content.trim(),
+    timestamp: timestamp || new Date().toISOString(),
+    receivedAt: new Date().toISOString()
   };
-
   const messages = readMessages();
   messages.unshift(message);
   writeMessages(messages);
-
   console.log(`📩 Nouveau message de ${message.fromName} (${message.from}) — "${message.subject}"`);
   return res.status(201).json({ success: true, id: message.id });
 });
 
 app.get('/messages', (req, res) => {
-  if (req.query.admin !== '1') {
-    return res.status(403).json({ success: false, error: 'Accès refusé.' });
-  }
+  if (req.query.admin !== '1') return res.status(403).json({ success: false, error: 'Accès refusé.' });
   return res.status(200).json(readMessages());
 });
 
 // ─── START ────────────────────────────────────────────────────────────────────
 app.listen(3000, () => {
-  console.log('🚀 Serveur démarré sur le port 3000');
+  const maintenance = process.env.MAINTENANCE_MODE === 'true' ? ' [MAINTENANCE]' : '';
+  console.log(`🚀 Serveur démarré sur le port 3000${maintenance}`);
 });
