@@ -17,11 +17,31 @@ function getStripe() {
   return Stripe(process.env.STRIPE_SECRET_KEY);
 }
 
-// ─── EMAIL TRANSPORTER ───────────────────────────────────────────────────────
-function getTransporter() {
-  if (!process.env.EMAIL_USER || !process.env.EMAIL_PASS || process.env.EMAIL_PASS === 'REMPLACER') {
-    return null;
-  }
+// ─── EMAIL VIA CLICKSEND (credentials déjà configurés) ───────────────────────
+async function sendEmailViaClickSend({ to, subject, html }) {
+  const username = process.env.CLICKSEND_USERNAME;
+  const apiKey   = process.env.CLICKSEND_API_KEY;
+  const fromEmail = process.env.EMAIL_USER || username;
+
+  const response = await axios.post(
+    'https://rest.clicksend.com/v3/email/send',
+    {
+      to:      [{ email: to, name: to }],
+      from:    { email: fromEmail, name: 'Notelo' },
+      subject,
+      body:    html
+    },
+    {
+      auth:    { username, password: apiKey },
+      headers: { 'Content-Type': 'application/json' }
+    }
+  );
+  return response.data;
+}
+
+// ─── EMAIL TRANSPORTER (Gmail — optionnel, fallback) ─────────────────────────
+function getGmailTransporter() {
+  if (!process.env.EMAIL_PASS || process.env.EMAIL_PASS === 'REMPLACER') return null;
   return nodemailer.createTransport({
     service: 'gmail',
     auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_PASS }
@@ -110,27 +130,36 @@ async function sendWelcomeEmail({ email, password, portalUrl }) {
     <p style="font-size:12px;color:#9ca3af;">Équipe Notelo — <a href="https://notelo.fr">notelo.fr</a></p>
   </div>`;
 
-  if (!transporter) {
-    const reason = 'EMAIL_USER / EMAIL_PASS non configurés';
-    console.warn(`⚠️  Email non envoyé à ${email} : ${reason}`);
-    savePendingEmail({ email, password, portalUrl, reason });
-    return { sent: false, reason };
+  // 1. Essai via ClickSend (credentials déjà en place)
+  try {
+    await sendEmailViaClickSend({ to: email, subject: 'Vos identifiants Notelo', html });
+    console.log(`📧 Email envoyé via ClickSend à ${email}`);
+    return { sent: true, provider: 'clicksend' };
+  } catch (clickErr) {
+    console.warn(`⚠️  ClickSend email échoué : ${clickErr.response?.data?.response_msg || clickErr.message}`);
   }
 
-  try {
-    await transporter.sendMail({
-      from:    `"Notelo" <${process.env.EMAIL_USER}>`,
-      to:      email,
-      subject: 'Vos identifiants Notelo',
-      html
-    });
-    console.log(`📧 Email envoyé à ${email}`);
-    return { sent: true };
-  } catch (err) {
-    console.error(`❌ Erreur envoi email à ${email} :`, err.message);
-    savePendingEmail({ email, password, portalUrl, reason: err.message });
-    return { sent: false, reason: err.message };
+  // 2. Fallback Gmail si configuré
+  const gmailTransporter = getGmailTransporter();
+  if (gmailTransporter) {
+    try {
+      await gmailTransporter.sendMail({
+        from:    `"Notelo" <${process.env.EMAIL_USER}>`,
+        to:      email,
+        subject: 'Vos identifiants Notelo',
+        html
+      });
+      console.log(`📧 Email envoyé via Gmail à ${email}`);
+      return { sent: true, provider: 'gmail' };
+    } catch (gmailErr) {
+      console.error(`❌ Gmail aussi échoué : ${gmailErr.message}`);
+    }
   }
+
+  // 3. Sauvegarde locale — rien n'est perdu
+  const reason = 'ClickSend et Gmail indisponibles';
+  savePendingEmail({ email, password, portalUrl, reason });
+  return { sent: false, reason };
 }
 
 // ─── LOGIQUE WEBHOOK ─────────────────────────────────────────────────────────
