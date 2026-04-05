@@ -76,13 +76,13 @@ function generatePassword() {
 
 // ─── ENVOI D'EMAIL ────────────────────────────────────────────────────────────
 async function sendWelcomeEmail({ email, password, portalUrl }) {
-  const dashboardUrl = process.env.DASHBOARD_URL || 'https://notelo.fr/dashboard';
-  const loginUrl     = process.env.LOGIN_URL     || 'https://notelo.fr/login';
+  const dashboardUrl = process.env.DASHBOARD_URL || 'https://notelo.eu/dashboard';
+  const loginUrl     = process.env.LOGIN_URL     || 'https://notelo.eu/login';
 
   const cancelSection = portalUrl
     ? `<p>Pour gérer ou <strong>annuler votre abonnement</strong>, cliquez ici :<br>
        <a href="${portalUrl}" style="color:#ef4444;">Gérer mon abonnement</a></p>`
-    : `<p>Pour annuler votre abonnement, contactez-nous à <a href="mailto:${process.env.EMAIL_USER || 'contact@notelo.fr'}">${process.env.EMAIL_USER || 'contact@notelo.fr'}</a>.</p>`;
+    : `<p>Pour annuler votre abonnement, contactez-nous à <a href="mailto:${process.env.EMAIL_USER || 'contact@notelo.eu'}">${process.env.EMAIL_USER || 'contact@notelo.eu'}</a>.</p>`;
 
   const html = `
   <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:24px;">
@@ -110,7 +110,7 @@ async function sendWelcomeEmail({ email, password, portalUrl }) {
     ${cancelSection}
 
     <hr style="margin-top:32px;border:none;border-top:1px solid #e5e7eb;">
-    <p style="font-size:12px;color:#9ca3af;">Équipe Notelo — <a href="https://notelo.fr">notelo.fr</a></p>
+    <p style="font-size:12px;color:#9ca3af;">Équipe Notelo — <a href="https://notelo.eu">notelo.eu</a></p>
   </div>`;
 
   // 1. Resend (HTTP API — pas bloqué par les hébergeurs)
@@ -150,7 +150,7 @@ async function createUserAndSendEmail({ email, stripeCustomerId, stripeSubId }) 
     try {
       const portalSession = await stripe.billingPortal.sessions.create({
         customer:   stripeCustomerId,
-        return_url: process.env.DASHBOARD_URL || 'https://notelo.fr/dashboard'
+        return_url: process.env.DASHBOARD_URL || 'https://notelo.eu/dashboard'
       });
       portalUrl = portalSession.url;
     } catch (err) {
@@ -377,7 +377,7 @@ app.use((req, res, next) => {
     <p>Notelo est temporairement indisponible pour des opérations de maintenance.</p>
     <p>Nous serons de retour très bientôt. Merci pour votre patience !</p>
     <p style="margin-top:24px;font-size:13px;">
-      Besoin d'aide ? <a href="mailto:${process.env.EMAIL_USER || 'contact@notelo.fr'}">${process.env.EMAIL_USER || 'contact@notelo.fr'}</a>
+      Besoin d'aide ? <a href="mailto:${process.env.EMAIL_USER || 'contact@notelo.eu'}">${process.env.EMAIL_USER || 'contact@notelo.eu'}</a>
     </p>
   </div>
 </body>
@@ -410,7 +410,7 @@ app.post('/cancel-subscription', async (req, res) => {
   try {
     const portalSession = await stripe.billingPortal.sessions.create({
       customer:   user.stripeCustomerId,
-      return_url: process.env.DASHBOARD_URL || 'https://notelo.fr/dashboard'
+      return_url: process.env.DASHBOARD_URL || 'https://notelo.eu/dashboard'
     });
     return res.json({ success: true, url: portalSession.url });
   } catch (err) {
@@ -421,7 +421,7 @@ app.post('/cancel-subscription', async (req, res) => {
 
 // ─── REDIRECT APRÈS PAIEMENT ──────────────────────────────────────────────────
 app.get('/payment-success', (req, res) => {
-  const loginUrl = process.env.LOGIN_URL || 'https://notelo.fr/login';
+  const loginUrl = process.env.LOGIN_URL || 'https://notelo.eu/login';
   res.redirect(302, loginUrl);
 });
 
