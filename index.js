@@ -17,35 +17,19 @@ function getStripe() {
   return Stripe(process.env.STRIPE_SECRET_KEY);
 }
 
-// ─── EMAIL VIA CLICKSEND (credentials déjà configurés) ───────────────────────
-async function sendEmailViaClickSend({ to, subject, html }) {
-  const username = process.env.CLICKSEND_USERNAME;
-  const apiKey   = process.env.CLICKSEND_API_KEY;
-  const fromEmail = process.env.EMAIL_USER || username;
+// ─── EMAIL VIA RESEND (HTTP API — fonctionne sur tous les hébergeurs) ────────
+async function sendEmailViaResend({ to, subject, html }) {
+  const apiKey    = process.env.RESEND_API_KEY;
+  const fromEmail = process.env.RESEND_FROM || 'onboarding@resend.dev';
+
+  if (!apiKey || apiKey === 'REMPLACER') throw new Error('RESEND_API_KEY non configuré');
 
   const response = await axios.post(
-    'https://rest.clicksend.com/v3/email/send',
-    {
-      to:      [{ email: to, name: to }],
-      from:    { email: fromEmail, name: 'Notelo' },
-      subject,
-      body:    html
-    },
-    {
-      auth:    { username, password: apiKey },
-      headers: { 'Content-Type': 'application/json' }
-    }
+    'https://api.resend.com/emails',
+    { from: `Notelo <${fromEmail}>`, to: [to], subject, html },
+    { headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' } }
   );
   return response.data;
-}
-
-// ─── EMAIL TRANSPORTER (Gmail — optionnel, fallback) ─────────────────────────
-function getGmailTransporter() {
-  if (!process.env.EMAIL_PASS || process.env.EMAIL_PASS === 'REMPLACER') return null;
-  return nodemailer.createTransport({
-    service: 'gmail',
-    auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_PASS }
-  });
 }
 
 // ─── PERSISTANCE UTILISATEURS ────────────────────────────────────────────────
@@ -130,39 +114,18 @@ async function sendWelcomeEmail({ email, password, portalUrl }) {
     <p style="font-size:12px;color:#9ca3af;">Équipe Notelo — <a href="https://notelo.fr">notelo.fr</a></p>
   </div>`;
 
-  // 1. Essai via ClickSend (credentials déjà en place)
+  // 1. Resend (HTTP API — pas bloqué par les hébergeurs)
   try {
-    await sendEmailViaClickSend({ to: email, subject: 'Vos identifiants Notelo', html });
-    console.log(`📧 Email envoyé via ClickSend à ${email}`);
-    return { sent: true, provider: 'clicksend' };
-  } catch (clickErr) {
-    console.warn(`⚠️  ClickSend email échoué : ${clickErr.response?.data?.response_msg || clickErr.message}`);
+    await sendEmailViaResend({ to: email, subject: 'Vos identifiants Notelo', html });
+    console.log(`📧 Email envoyé via Resend à ${email}`);
+    return { sent: true, provider: 'resend' };
+  } catch (resendErr) {
+    const errMsg = resendErr.response?.data?.message || resendErr.message;
+    console.warn(`⚠️  Resend échoué : ${errMsg}`);
+    const reason = `Resend: ${errMsg}`;
+    savePendingEmail({ email, password, portalUrl, reason });
+    return { sent: false, reason };
   }
-
-  // 2. Fallback Gmail si configuré
-  const gmailTransporter = getGmailTransporter();
-  if (gmailTransporter) {
-    try {
-      await gmailTransporter.sendMail({
-        from:    `"Notelo" <${process.env.EMAIL_USER}>`,
-        to:      email,
-        subject: 'Vos identifiants Notelo',
-        html
-      });
-      console.log(`📧 Email envoyé via Gmail à ${email}`);
-      return { sent: true, provider: 'gmail' };
-    } catch (gmailErr) {
-      console.error(`❌ Gmail aussi échoué : ${gmailErr.message}`);
-      const reason = `Gmail: ${gmailErr.message}`;
-      savePendingEmail({ email, password, portalUrl, reason });
-      return { sent: false, reason };
-    }
-  }
-
-  // 3. Sauvegarde locale — rien n'est perdu
-  const reason = 'ClickSend et Gmail indisponibles';
-  savePendingEmail({ email, password, portalUrl, reason });
-  return { sent: false, reason };
 }
 
 // ─── LOGIQUE WEBHOOK ─────────────────────────────────────────────────────────
@@ -299,8 +262,9 @@ app.get('/admin/health', requireAdmin, (req, res) => {
       webhookSecret: process.env.STRIPE_WEBHOOK_SECRET !== 'whsec_REMPLACER' && !!process.env.STRIPE_WEBHOOK_SECRET
     },
     email: {
-      configured: !!transporter,
-      user:       process.env.EMAIL_USER || 'manquant'
+      configured: !!(process.env.RESEND_API_KEY && process.env.RESEND_API_KEY !== 'REMPLACER'),
+      provider:   'resend',
+      from:       process.env.RESEND_FROM || 'onboarding@resend.dev'
     },
     users: {
       total:  Object.keys(users).length,
