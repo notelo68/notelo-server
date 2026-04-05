@@ -92,7 +92,7 @@ function generatePassword(length = 12) {
 
 // ─── ENVOI D'EMAIL ────────────────────────────────────────────────────────────
 async function sendWelcomeEmail({ email, password, portalUrl }) {
-  const transporter  = getTransporter();
+  const transporter  = getGmailTransporter();
   const dashboardUrl = process.env.DASHBOARD_URL || 'https://notelo.fr/dashboard';
   const loginUrl     = process.env.LOGIN_URL     || 'https://notelo.fr/login';
 
@@ -284,7 +284,7 @@ function requireAdmin(req, res, next) {
 // GET /admin/health — vérifie la config
 app.get('/admin/health', requireAdmin, (req, res) => {
   const stripe      = getStripe();
-  const transporter = getTransporter();
+  const transporter = getGmailTransporter();
   const users       = readUsers();
 
   res.json({
