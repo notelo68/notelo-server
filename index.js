@@ -16,6 +16,61 @@ app.use((req, res, next) => {
   next();
 });
 
+// ─── PERSISTANCE LIENS RACCOURCIS ───
+const LINKS_FILE = path.join(__dirname, 'links.json');
+
+function readLinks() {
+  try {
+    if (!fs.existsSync(LINKS_FILE)) return {};
+    return JSON.parse(fs.readFileSync(LINKS_FILE, 'utf8'));
+  } catch (e) { return {}; }
+}
+
+function writeLinks(links) {
+  fs.writeFileSync(LINKS_FILE, JSON.stringify(links, null, 2), 'utf8');
+}
+
+function generateCode() {
+  const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
+  let code = '';
+  for (let i = 0; i < 6; i++) code += chars[Math.floor(Math.random() * chars.length)];
+  return code;
+}
+
+// POST /shorten — raccourcit une URL
+app.post('/shorten', (req, res) => {
+  const { url } = req.body;
+  if (!url || !url.startsWith('http')) {
+    return res.status(400).json({ success: false, error: 'URL invalide' });
+  }
+
+  const links = readLinks();
+  const BASE_URL = process.env.BASE_URL || 'https://notelo-server.onrender.com';
+
+  // Réutiliser un code existant si l'URL est déjà connue
+  const existing = Object.entries(links).find(([, data]) => data.url === url);
+  if (existing) {
+    return res.json({ success: true, short: `${BASE_URL}/r/${existing[0]}` });
+  }
+
+  let code;
+  do { code = generateCode(); } while (links[code]);
+
+  links[code] = { url, createdAt: new Date().toISOString() };
+  writeLinks(links);
+
+  console.log(`🔗 Raccourci : ${BASE_URL}/r/${code} → ${url}`);
+  return res.status(201).json({ success: true, short: `${BASE_URL}/r/${code}` });
+});
+
+// GET /r/:code — redirection vers l'URL originale
+app.get('/r/:code', (req, res) => {
+  const links = readLinks();
+  const data = links[req.params.code];
+  if (!data) return res.status(404).send('Lien introuvable ou expiré.');
+  return res.redirect(301, data.url);
+});
+
 // ─── PERSISTANCE MESSAGES (fichier JSON local) ───
 const MESSAGES_FILE = path.join(__dirname, 'messages.json');
 
