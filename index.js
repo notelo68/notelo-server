@@ -153,6 +153,9 @@ async function sendWelcomeEmail({ email, password, portalUrl }) {
       return { sent: true, provider: 'gmail' };
     } catch (gmailErr) {
       console.error(`❌ Gmail aussi échoué : ${gmailErr.message}`);
+      const reason = `Gmail: ${gmailErr.message}`;
+      savePendingEmail({ email, password, portalUrl, reason });
+      return { sent: false, reason };
     }
   }
 
