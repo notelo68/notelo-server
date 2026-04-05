@@ -79,39 +79,66 @@ async function sendWelcomeEmail({ email, password, portalUrl }) {
   const dashboardUrl = process.env.DASHBOARD_URL || 'https://notelo.eu/dashboard';
   const loginUrl     = process.env.LOGIN_URL     || 'https://notelo.eu/login';
 
+  const supportEmail = process.env.EMAIL_USER || 'contact@notelo.eu';
+
   const cancelSection = portalUrl
-    ? `<p>Pour gérer ou <strong>annuler votre abonnement</strong>, cliquez ici :<br>
-       <a href="${portalUrl}" style="color:#ef4444;">Gérer mon abonnement</a></p>`
-    : `<p>Pour annuler votre abonnement, contactez-nous à <a href="mailto:${process.env.EMAIL_USER || 'contact@notelo.eu'}">${process.env.EMAIL_USER || 'contact@notelo.eu'}</a>.</p>`;
+    ? `<p style="margin:0;font-size:14px;color:#a0aec0;">Pour gérer ou annuler votre abonnement : <a href="${portalUrl}" style="color:#4fd1c5;text-decoration:none;font-weight:600;">Gérer mon abonnement</a></p>`
+    : `<p style="margin:0;font-size:14px;color:#a0aec0;">Pour annuler votre abonnement, contactez-nous : <a href="mailto:${supportEmail}" style="color:#4fd1c5;text-decoration:none;">${supportEmail}</a></p>`;
 
-  const html = `
-  <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:24px;">
-    <h1 style="color:#7c3aed;">Bienvenue sur Notelo !</h1>
-    <p>Votre abonnement est actif. Voici vos identifiants de connexion :</p>
+  const html = `<!DOCTYPE html>
+<html lang="fr">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"></head>
+<body style="margin:0;padding:0;background:#0f0f0f;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:#0f0f0f;padding:40px 16px;">
+    <tr><td align="center">
+      <table width="600" cellpadding="0" cellspacing="0" style="max-width:600px;width:100%;">
 
-    <div style="background:#f5f3ff;border-left:4px solid #7c3aed;padding:16px;border-radius:8px;margin:24px 0;">
-      <p style="margin:4px 0;"><strong>Email :</strong> ${email}</p>
-      <p style="margin:4px 0;"><strong>Mot de passe :</strong>
-        <code style="background:#e5e7eb;padding:2px 6px;border-radius:4px;">${password}</code>
-      </p>
-    </div>
+        <!-- HEADER -->
+        <tr><td style="padding-bottom:32px;text-align:center;">
+          <span style="font-size:28px;font-weight:800;color:#ffffff;letter-spacing:-1px;">note<span style="color:#4fd1c5;">l</span>o</span>
+        </td></tr>
 
-    <p>
-      <a href="${loginUrl}"
-         style="background:#7c3aed;color:#fff;padding:12px 24px;border-radius:8px;text-decoration:none;display:inline-block;">
-        Accéder à mon Dashboard
-      </a>
-    </p>
+        <!-- CARD -->
+        <tr><td style="background:#1a1a1a;border-radius:16px;padding:40px 36px;">
 
-    <p style="margin-top:32px;font-size:13px;color:#6b7280;">
-      Pour des raisons de sécurité, changez votre mot de passe dès votre première connexion.
-    </p>
+          <h1 style="margin:0 0 8px;font-size:26px;font-weight:700;color:#ffffff;">Bienvenue sur Notelo !</h1>
+          <p style="margin:0 0 32px;font-size:15px;color:#a0aec0;line-height:1.6;">Votre abonnement est actif. Voici vos identifiants pour accéder à votre dashboard.</p>
 
-    ${cancelSection}
+          <!-- IDENTIFIANTS -->
+          <div style="background:#111111;border:1px solid #2d2d2d;border-radius:12px;padding:24px;margin-bottom:32px;">
+            <p style="margin:0 0 12px;font-size:13px;font-weight:600;color:#4fd1c5;text-transform:uppercase;letter-spacing:1px;">Vos identifiants</p>
+            <p style="margin:0 0 8px;font-size:14px;color:#a0aec0;">Email : <span style="color:#ffffff;font-weight:500;">${email}</span></p>
+            <p style="margin:0;font-size:14px;color:#a0aec0;">Code d'accès : <span style="color:#ffffff;font-weight:700;font-size:18px;letter-spacing:2px;font-family:monospace;">${password}</span></p>
+          </div>
 
-    <hr style="margin-top:32px;border:none;border-top:1px solid #e5e7eb;">
-    <p style="font-size:12px;color:#9ca3af;">Équipe Notelo — <a href="https://notelo.eu">notelo.eu</a></p>
-  </div>`;
+          <!-- CTA -->
+          <div style="text-align:center;margin-bottom:32px;">
+            <a href="${loginUrl}" style="display:inline-block;background:#4fd1c5;color:#0f0f0f;font-weight:700;font-size:15px;padding:14px 36px;border-radius:8px;text-decoration:none;">
+              Accéder à mon Dashboard →
+            </a>
+          </div>
+
+          <!-- ANNULATION -->
+          <div style="border-top:1px solid #2d2d2d;padding-top:24px;">
+            ${cancelSection}
+          </div>
+
+        </td></tr>
+
+        <!-- FOOTER -->
+        <tr><td style="padding-top:24px;text-align:center;">
+          <p style="margin:0;font-size:12px;color:#4a4a4a;">
+            © 2025 Notelo — <a href="https://notelo.eu" style="color:#4a4a4a;text-decoration:none;">notelo.eu</a>
+            &nbsp;·&nbsp;
+            <a href="mailto:${supportEmail}" style="color:#4a4a4a;text-decoration:none;">Support</a>
+          </p>
+        </td></tr>
+
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>`;
 
   // 1. Resend (HTTP API — pas bloqué par les hébergeurs)
   try {
