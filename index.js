@@ -66,12 +66,12 @@ function hashPassword(password) {
   return `${salt}:${hash}`;
 }
 
-function generatePassword(length = 12) {
-  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789!@#$%';
-  let pwd = '';
-  const bytes = crypto.randomBytes(length);
-  for (let i = 0; i < length; i++) pwd += chars[bytes[i] % chars.length];
-  return pwd;
+function generatePassword() {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  let suffix = '';
+  const bytes = crypto.randomBytes(4);
+  for (let i = 0; i < 4; i++) suffix += chars[bytes[i] % chars.length];
+  return `NOTELO-${suffix}`;
 }
 
 // ─── ENVOI D'EMAIL ────────────────────────────────────────────────────────────
