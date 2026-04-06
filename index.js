@@ -1,29 +1,29 @@
 require('dotenv').config();
 const express    = require('express');
 const axios      = require('axios');
-const fs         = require('fs');
-const path       = require('path');
 const crypto     = require('crypto');
 const Stripe     = require('stripe');
-const nodemailer = require('nodemailer');
+const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
 
-// ─── STRIPE (lazy init — ne crashe pas si la clé manque) ─────────────────────
+// ─── SUPABASE ─────────────────────────────────────────────────────────────────
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_ANON_KEY
+);
+
+// ─── STRIPE (lazy init) ───────────────────────────────────────────────────────
 function getStripe() {
-  if (!process.env.STRIPE_SECRET_KEY || process.env.STRIPE_SECRET_KEY === 'sk_test_REMPLACER') {
-    return null;
-  }
+  if (!process.env.STRIPE_SECRET_KEY || process.env.STRIPE_SECRET_KEY === 'sk_test_REMPLACER') return null;
   return Stripe(process.env.STRIPE_SECRET_KEY);
 }
 
-// ─── EMAIL VIA RESEND (HTTP API — fonctionne sur tous les hébergeurs) ────────
+// ─── EMAIL VIA RESEND ─────────────────────────────────────────────────────────
 async function sendEmailViaResend({ to, subject, html }) {
   const apiKey    = process.env.RESEND_API_KEY;
   const fromEmail = process.env.RESEND_FROM || 'onboarding@resend.dev';
-
   if (!apiKey || apiKey === 'REMPLACER') throw new Error('RESEND_API_KEY non configuré');
-
   const response = await axios.post(
     'https://api.resend.com/emails',
     { from: `Notelo <${fromEmail}>`, to: [to], subject, html },
@@ -32,32 +32,34 @@ async function sendEmailViaResend({ to, subject, html }) {
   return response.data;
 }
 
-// ─── PERSISTANCE UTILISATEURS ────────────────────────────────────────────────
-const USERS_FILE         = path.join(__dirname, 'users.json');
-const PENDING_EMAILS_FILE = path.join(__dirname, 'pending-emails.json');
-
-function readUsers() {
-  try {
-    if (!fs.existsSync(USERS_FILE)) return {};
-    return JSON.parse(fs.readFileSync(USERS_FILE, 'utf8'));
-  } catch (e) { return {}; }
+// ─── PERSISTANCE UTILISATEURS (Supabase) ──────────────────────────────────────
+async function getUserByEmail(email) {
+  const { data } = await supabase.from('users').select('*').eq('email', email).single();
+  return data;
 }
 
-function writeUsers(users) {
-  fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 2), 'utf8');
+async function createUser({ email, passwordHash, stripeCustomerId, stripeSubId }) {
+  const { data, error } = await supabase.from('users').insert([{
+    email,
+    password_hash:          passwordHash,
+    stripe_customer_id:     stripeCustomerId || null,
+    stripe_subscription_id: stripeSubId      || null,
+    subscription_status:    'active'
+  }]).select().single();
+  if (error) throw error;
+  return data;
 }
 
-// Sauvegarde les identifiants en local si l'email ne part pas (rien n'est perdu)
-function savePendingEmail({ email, password, portalUrl, reason }) {
-  let pending = [];
-  try {
-    if (fs.existsSync(PENDING_EMAILS_FILE)) {
-      pending = JSON.parse(fs.readFileSync(PENDING_EMAILS_FILE, 'utf8'));
-    }
-  } catch (e) { /* ignore */ }
-  pending.push({ email, password, portalUrl, reason, savedAt: new Date().toISOString() });
-  fs.writeFileSync(PENDING_EMAILS_FILE, JSON.stringify(pending, null, 2), 'utf8');
-  console.log(`💾 Identifiants sauvegardés localement pour ${email} (email non envoyé : ${reason})`);
+async function updateUserStatus(field, value, status) {
+  const { error } = await supabase.from('users')
+    .update({ subscription_status: status })
+    .eq(field, value);
+  if (error) console.error('Erreur update user:', error.message);
+}
+
+async function savePendingEmail({ email, password, portalUrl, reason }) {
+  await supabase.from('pending_emails').insert([{ email, password, portal_url: portalUrl, reason }]);
+  console.log(`💾 Email en attente sauvegardé pour ${email}`);
 }
 
 function hashPassword(password) {
@@ -156,28 +158,18 @@ async function sendWelcomeEmail({ email, password, portalUrl }) {
 
 // ─── LOGIQUE WEBHOOK ─────────────────────────────────────────────────────────
 async function createUserAndSendEmail({ email, stripeCustomerId, stripeSubId }) {
-  const users    = readUsers();
   const password = generatePassword();
 
-  users[email] = {
-    email,
-    passwordHash:         hashPassword(password),
-    stripeCustomerId:     stripeCustomerId || null,
-    stripeSubscriptionId: stripeSubId      || null,
-    subscriptionStatus:   'active',
-    createdAt:            new Date().toISOString()
-  };
-  writeUsers(users);
+  await createUser({ email, passwordHash: hashPassword(password), stripeCustomerId, stripeSubId });
   console.log(`✅ Utilisateur créé : ${email}`);
 
-  // Lien portail Stripe pour gérer/annuler
   let portalUrl = null;
   const stripe = getStripe();
   if (stripe && stripeCustomerId) {
     try {
       const portalSession = await stripe.billingPortal.sessions.create({
         customer:   stripeCustomerId,
-        return_url: process.env.DASHBOARD_URL || 'https://notelo.eu/dashboard'
+        return_url: process.env.DASHBOARD_URL || 'https://notelo.eu/login.html'
       });
       portalUrl = portalSession.url;
     } catch (err) {
@@ -190,43 +182,25 @@ async function createUserAndSendEmail({ email, stripeCustomerId, stripeSubId }) 
 
 async function handleCheckoutCompleted(session) {
   const email = session.customer_details?.email || session.customer_email;
-  if (!email) {
-    console.error('❌ checkout.session.completed : aucun email trouvé.');
-    return;
+  if (!email) { console.error('❌ Aucun email dans la session.'); return; }
+
+  const existing = await getUserByEmail(email);
+  if (existing?.subscription_status === 'active') {
+    console.log(`ℹ️  ${email} déjà actif.`); return;
   }
 
-  const users = readUsers();
-  if (users[email]?.subscriptionStatus === 'active') {
-    console.log(`ℹ️  ${email} est déjà actif.`);
-    return;
-  }
-
-  await createUserAndSendEmail({
-    email,
-    stripeCustomerId: session.customer,
-    stripeSubId:      session.subscription
-  });
+  await createUserAndSendEmail({ email, stripeCustomerId: session.customer, stripeSubId: session.subscription });
 }
 
-function handleSubscriptionDeleted(subscription) {
-  const users = readUsers();
-  const user  = Object.values(users).find(u => u.stripeSubscriptionId === subscription.id);
-  if (user) {
-    user.subscriptionStatus = 'cancelled';
-    writeUsers(users);
-    console.log(`🚫 Abonnement annulé pour ${user.email}`);
-  }
+async function handleSubscriptionDeleted(subscription) {
+  await updateUserStatus('stripe_subscription_id', subscription.id, 'cancelled');
+  console.log(`🚫 Abonnement annulé : ${subscription.id}`);
 }
 
-function handleInvoicePaymentSucceeded(invoice) {
+async function handleInvoicePaymentSucceeded(invoice) {
   if (invoice.billing_reason === 'subscription_create') return;
-  const users = readUsers();
-  const user  = Object.values(users).find(u => u.stripeCustomerId === invoice.customer);
-  if (user && user.subscriptionStatus !== 'active') {
-    user.subscriptionStatus = 'active';
-    writeUsers(users);
-    console.log(`🔄 Abonnement réactivé pour ${user.email}`);
-  }
+  await updateUserStatus('stripe_customer_id', invoice.customer, 'active');
+  console.log(`🔄 Abonnement réactivé : ${invoice.customer}`);
 }
 
 // ─── STRIPE WEBHOOK — AVANT express.json() ───────────────────────────────────
@@ -274,7 +248,7 @@ function requireAdmin(req, res, next) {
 // ─── ROUTES ADMIN (exclues de la maintenance) ─────────────────────────────────
 
 // GET /admin/health — vérifie la config
-app.get('/admin/health', requireAdmin, (req, res) => {
+app.get('/admin/health', requireAdmin, async (req, res) => {
   const stripe = getStripe();
   const users  = readUsers();
 
@@ -291,72 +265,55 @@ app.get('/admin/health', requireAdmin, (req, res) => {
       provider:   'resend',
       from:       process.env.RESEND_FROM || 'onboarding@resend.dev'
     },
-    users: {
-      total:  Object.keys(users).length,
-      active: Object.values(users).filter(u => u.subscriptionStatus === 'active').length
-    }
+    users: await supabase.from('users').select('id', { count: 'exact', head: true })
+      .then(({ count }) => ({ total: count || 0 }))
   });
 });
 
 // GET /admin/users — liste des utilisateurs
-app.get('/admin/users', requireAdmin, (req, res) => {
-  const users = readUsers();
-  // Ne renvoie pas les hash de mots de passe
-  const safe = Object.values(users).map(({ passwordHash, ...rest }) => rest);
-  res.json({ success: true, count: safe.length, users: safe });
+app.get('/admin/users', requireAdmin, async (req, res) => {
+  const { data, error } = await supabase.from('users')
+    .select('id, email, stripe_customer_id, stripe_subscription_id, subscription_status, created_at')
+    .order('created_at', { ascending: false });
+  if (error) return res.status(500).json({ success: false, error: error.message });
+  res.json({ success: true, count: data.length, users: data });
 });
 
-// POST /admin/send-welcome-email — envoie manuellement les identifiants
-// Usage : { "email": "client@example.com", "stripeCustomerId": "cus_xxx" (optionnel) }
+// POST /admin/send-welcome-email
 app.post('/admin/send-welcome-email', requireAdmin, async (req, res) => {
   const { email, stripeCustomerId } = req.body;
   if (!email) return res.status(400).json({ success: false, error: 'email requis.' });
 
   const result = await createUserAndSendEmail({
-    email:            email.toLowerCase().trim(),
+    email: email.toLowerCase().trim(),
     stripeCustomerId: stripeCustomerId || null,
-    stripeSubId:      null
+    stripeSubId: null
   });
 
   res.json({ success: true, email, emailResult: result });
 });
 
-// GET /admin/pending-emails — identifiants en attente (email non envoyé)
-app.get('/admin/pending-emails', requireAdmin, (req, res) => {
-  try {
-    if (!fs.existsSync(PENDING_EMAILS_FILE)) return res.json({ success: true, count: 0, pending: [] });
-    const pending = JSON.parse(fs.readFileSync(PENDING_EMAILS_FILE, 'utf8'));
-    res.json({ success: true, count: pending.length, pending });
-  } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
-  }
+// GET /admin/pending-emails
+app.get('/admin/pending-emails', requireAdmin, async (req, res) => {
+  const { data, error } = await supabase.from('pending_emails').select('*').order('saved_at', { ascending: false });
+  if (error) return res.status(500).json({ success: false, error: error.message });
+  res.json({ success: true, count: data.length, pending: data });
 });
 
-// POST /admin/retry-pending-emails — renvoie tous les emails en attente
+// POST /admin/retry-pending-emails
 app.post('/admin/retry-pending-emails', requireAdmin, async (req, res) => {
-  try {
-    if (!fs.existsSync(PENDING_EMAILS_FILE)) return res.json({ success: true, message: 'Aucun email en attente.' });
-    const pending = JSON.parse(fs.readFileSync(PENDING_EMAILS_FILE, 'utf8'));
-    if (pending.length === 0) return res.json({ success: true, message: 'Aucun email en attente.' });
+  const { data: pending, error } = await supabase.from('pending_emails').select('*');
+  if (error) return res.status(500).json({ success: false, error: error.message });
+  if (!pending?.length) return res.json({ success: true, message: 'Aucun email en attente.' });
 
-    const results = [];
-    const remaining = [];
-
-    for (const entry of pending) {
-      const result = await sendWelcomeEmail({
-        email:     entry.email,
-        password:  entry.password,
-        portalUrl: entry.portalUrl
-      });
-      results.push({ email: entry.email, ...result });
-      if (!result.sent) remaining.push(entry); // garde ceux qui ont encore échoué
-    }
-
-    fs.writeFileSync(PENDING_EMAILS_FILE, JSON.stringify(remaining, null, 2), 'utf8');
-    res.json({ success: true, results, stillPending: remaining.length });
-  } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
+  const results = [];
+  for (const entry of pending) {
+    const result = await sendWelcomeEmail({ email: entry.email, password: entry.password, portalUrl: entry.portal_url });
+    results.push({ email: entry.email, ...result });
+    if (result.sent) await supabase.from('pending_emails').delete().eq('id', entry.id);
   }
+
+  res.json({ success: true, results });
 });
 
 // POST /admin/maintenance — active/désactive la maintenance à chaud
@@ -425,19 +382,18 @@ app.post('/cancel-subscription', async (req, res) => {
   const { email } = req.body;
   if (!email) return res.status(400).json({ success: false, error: 'Email requis.' });
 
-  const users = readUsers();
-  const user  = users[email?.toLowerCase().trim()];
+  const user = await getUserByEmail(email.toLowerCase().trim());
 
   if (!user) return res.status(404).json({ success: false, error: 'Aucun abonnement trouvé pour cet email.' });
-  if (!user.stripeCustomerId) return res.status(400).json({ success: false, error: 'Aucun client Stripe associé.' });
+  if (!user.stripe_customer_id) return res.status(400).json({ success: false, error: 'Aucun client Stripe associé.' });
 
   const stripe = getStripe();
   if (!stripe) return res.status(503).json({ success: false, error: 'Stripe non configuré.' });
 
   try {
     const portalSession = await stripe.billingPortal.sessions.create({
-      customer:   user.stripeCustomerId,
-      return_url: process.env.DASHBOARD_URL || 'https://notelo.eu/dashboard'
+      customer:   user.stripe_customer_id,
+      return_url: process.env.DASHBOARD_URL || 'https://notelo.eu/login.html'
     });
     return res.json({ success: true, url: portalSession.url });
   } catch (err) {
