@@ -479,22 +479,39 @@ app.post('/send-sms', async (req, res) => {
   }
 
   const message = `Bonjour ${prenom}, merci pour votre visite chez ${nomPro} ! Pouvez-vous nous laisser un avis Google ? ${lienGoogle} - STOP SMS`;
+
   try {
-    const response = await axios.post(
-      'https://rest.clicksend.com/v3/sms/send',
-      { messages: [{ to: telephone, body: message, source: 'nodejs' }] },
-      {
-        auth:    { username: process.env.CLICKSEND_USERNAME, password: process.env.CLICKSEND_API_KEY },
-        headers: { 'Content-Type': 'application/json' }
-      }
-    );
-    const messageData = response.data?.data?.messages?.[0];
-    if (messageData?.status === 'SUCCESS') {
-      return res.status(200).json({ success: true, message: 'SMS envoyé avec succès.', details: messageData });
-    }
-    return res.status(502).json({ success: false, error: 'ClickSend a retourné un statut inattendu.', details: messageData });
+    const OvhApi  = require('ovh');
+    const ovh = OvhApi({
+      appKey:      process.env.OVH_APP_KEY,
+      appSecret:   process.env.OVH_APP_SECRET,
+      consumerKey: process.env.OVH_CONSUMER_KEY,
+      endpoint:    'ovh-eu'
+    });
+
+    // Récupère le nom du service SMS automatiquement
+    const services = await new Promise((resolve, reject) => {
+      ovh.request('GET', '/sms', (err, result) => err ? reject(err) : resolve(result));
+    });
+    const serviceName = services[0];
+    if (!serviceName) throw new Error('Aucun service SMS OVH trouvé');
+
+    await new Promise((resolve, reject) => {
+      ovh.request('POST', `/sms/${serviceName}/jobs`, {
+        charset:           'UTF-8',
+        coding:            '7bit',
+        message,
+        noStopClause:      false,
+        priority:          'high',
+        receivers:         [telephone],
+        senderForResponse: false,
+        validityPeriod:    2880
+      }, (err, result) => err ? reject(err) : resolve(result));
+    });
+
+    return res.status(200).json({ success: true, message: 'SMS envoyé avec succès via OVH.' });
   } catch (err) {
-    return res.status(500).json({ success: false, error: "Erreur lors de l'envoi du SMS.", details: err.response?.data || err.message });
+    return res.status(500).json({ success: false, error: "Erreur lors de l'envoi du SMS.", details: err.message });
   }
 });
 
