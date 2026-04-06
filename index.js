@@ -2,6 +2,8 @@ require('dotenv').config();
 const express    = require('express');
 const axios      = require('axios');
 const crypto     = require('crypto');
+const fs         = require('fs');
+const path       = require('path');
 const Stripe     = require('stripe');
 const { createClient } = require('@supabase/supabase-js');
 
