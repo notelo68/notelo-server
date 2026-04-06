@@ -191,4 +191,17 @@ curl -X POST https://notelo-server.onrender.com/admin/maintenance \
 
 ---
 
-*Document généré le 06/04/2026*
+---
+
+## 10. Historique des sessions
+
+### Session 06/04/2026
+- Mise en place complète du système d'abonnement Stripe + webhook
+- Email de bienvenue avec code `NOTELO-XXXX` via Resend
+- Migration `users.json` → Supabase PostgreSQL
+- Routes admin (health, users, send-welcome-email, pending-emails, maintenance)
+- Redirect après paiement vers `notelo.eu/login.html`
+- Annulation abonnement via Stripe Customer Portal
+- Création `CLAUDE.md` pour mise à jour automatique du doc
+
+*Dernière mise à jour : 06/04/2026*
