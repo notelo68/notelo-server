@@ -252,7 +252,6 @@ function requireAdmin(req, res, next) {
 // GET /admin/health — vérifie la config
 app.get('/admin/health', requireAdmin, async (req, res) => {
   const stripe = getStripe();
-  const users  = readUsers();
 
   res.json({
     status:      'ok',
