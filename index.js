@@ -511,7 +511,7 @@ app.post('/send-sms', async (req, res) => {
 
     return res.status(200).json({ success: true, message: 'SMS envoyé avec succès via OVH.' });
   } catch (err) {
-    return res.status(500).json({ success: false, error: "Erreur lors de l'envoi du SMS.", details: err.message });
+    return res.status(500).json({ success: false, error: "Erreur lors de l'envoi du SMS.", details: typeof err === 'object' ? JSON.stringify(err) : String(err) });
   }
 });
 
