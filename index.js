@@ -113,7 +113,6 @@ app.post('/send-sms', async (req, res) => {
       ovhClient.request('POST', `/sms/${OVH_SMS_SERVICE}/jobs`, {
         message,
         receivers: [telephone],
-        sender:    OVH_SMS_SENDER,
         noStopClause: false,
         priority:  'high',
         charset:   'UTF-8'
