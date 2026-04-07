@@ -87,8 +87,14 @@ function writeMessages(messages) {
   fs.writeFileSync(MESSAGES_FILE, JSON.stringify(messages, null, 2), 'utf8');
 }
 
-const CLICKSEND_USERNAME = process.env.CLICKSEND_USERNAME;
-const CLICKSEND_API_KEY = process.env.CLICKSEND_API_KEY;
+const ovhClient = require('ovh')({
+  appKey:      process.env.OVH_APP_KEY,
+  appSecret:   process.env.OVH_APP_SECRET,
+  consumerKey: process.env.OVH_CONSUMER_KEY
+});
+
+const OVH_SMS_SERVICE = process.env.OVH_SMS_SERVICE;
+const OVH_SMS_SENDER  = process.env.OVH_SMS_SENDER || 'Notelo';
 
 app.post('/send-sms', async (req, res) => {
   const { prenom, telephone, nomPro, lienGoogle } = req.body;
@@ -103,50 +109,31 @@ app.post('/send-sms', async (req, res) => {
   const message = `Bonjour ${prenom}, merci pour votre visite chez ${nomPro} ! Pouvez-vous nous laisser un avis Google ? ${lienGoogle} - STOP SMS`;
 
   try {
-    const response = await axios.post(
-      'https://rest.clicksend.com/v3/sms/send',
-      {
-        messages: [
-          {
-            to: telephone,
-            body: message,
-            source: 'nodejs'
-          }
-        ]
-      },
-      {
-        auth: {
-          username: CLICKSEND_USERNAME,
-          password: CLICKSEND_API_KEY
-        },
-        headers: {
-          'Content-Type': 'application/json'
-        }
-      }
-    );
-
-    const messageData = response.data?.data?.messages?.[0];
-    const status = messageData?.status;
-
-    if (status === 'SUCCESS') {
-      return res.status(200).json({
-        success: true,
-        message: 'SMS envoyé avec succès.',
-        details: messageData
+    const result = await new Promise((resolve, reject) => {
+      ovhClient.request('POST', `/sms/${OVH_SMS_SERVICE}/jobs`, {
+        message,
+        receivers: [telephone],
+        sender:    OVH_SMS_SENDER,
+        noStopClause: false,
+        priority:  'high',
+        charset:   'UTF-8'
+      }, (err, data) => {
+        if (err) reject(err);
+        else resolve(data);
       });
-    } else {
-      return res.status(502).json({
-        success: false,
-        error: 'ClickSend a retourné un statut inattendu.',
-        details: messageData
-      });
-    }
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: 'SMS envoyé avec succès.',
+      details: result
+    });
   } catch (err) {
-    const clicksendError = err.response?.data;
+    console.error('Erreur OVH SMS :', err);
     return res.status(500).json({
       success: false,
-      error: 'Erreur lors de l\'envoi du SMS.',
-      details: clicksendError || err.message
+      error: 'Erreur lors de l\'envoi du SMS via OVH.',
+      details: err.message || err
     });
   }
 });
