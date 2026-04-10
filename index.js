@@ -472,6 +472,73 @@ function writeMessages(messages) {
   fs.writeFileSync(MESSAGES_FILE, JSON.stringify(messages, null, 2), 'utf8');
 }
 
+// Helper OVH — crée le client une seule fois
+function getOvhClient() {
+  const OvhApi = require('ovh');
+  return OvhApi({
+    appKey:      process.env.OVH_APP_KEY,
+    appSecret:   process.env.OVH_APP_SECRET,
+    consumerKey: process.env.OVH_CONSUMER_KEY,
+    endpoint:    'ovh-eu'
+  });
+}
+
+// Helper OVH — promise avec capture du corps d'erreur
+function ovhRequest(ovh, method, path, body) {
+  return new Promise((resolve, reject) => {
+    const cb = (err, result) => {
+      if (err) {
+        // OVH renvoie le code HTTP comme err et le corps comme result
+        reject({ statusCode: err, body: result });
+      } else {
+        resolve(result);
+      }
+    };
+    if (body !== undefined) ovh.request(method, path, body, cb);
+    else                    ovh.request(method, path, cb);
+  });
+}
+
+// GET /admin/test-ovh — diagnostique la connexion OVH pas à pas
+app.get('/admin/test-ovh', requireAdmin, async (req, res) => {
+  const checks = {};
+  try {
+    const ovh = getOvhClient();
+
+    // 1. Vérifier l'authentification (appelle /auth/time — sans droits requis)
+    try {
+      await ovhRequest(ovh, 'GET', '/auth/time');
+      checks.auth_time = 'ok';
+    } catch (e) {
+      checks.auth_time = `erreur ${e.statusCode} — ${JSON.stringify(e.body)}`;
+    }
+
+    // 2. Lister les services SMS
+    let serviceName = null;
+    try {
+      const services = await ovhRequest(ovh, 'GET', '/sms');
+      checks.sms_services = services;
+      serviceName = services?.[0] || null;
+    } catch (e) {
+      checks.sms_services = `erreur ${e.statusCode} — ${JSON.stringify(e.body)}`;
+    }
+
+    // 3. Infos du service SMS si disponible
+    if (serviceName) {
+      try {
+        const info = await ovhRequest(ovh, 'GET', `/sms/${serviceName}`);
+        checks.sms_info = { name: serviceName, credits: info.creditsLeft, status: info.status };
+      } catch (e) {
+        checks.sms_info = `erreur ${e.statusCode} — ${JSON.stringify(e.body)}`;
+      }
+    }
+
+    return res.json({ success: true, checks });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: String(err), checks });
+  }
+});
+
 app.post('/send-sms', async (req, res) => {
   const { prenom, telephone, nomPro, lienGoogle } = req.body;
   if (!prenom || !telephone || !nomPro || !lienGoogle) {
@@ -481,37 +548,31 @@ app.post('/send-sms', async (req, res) => {
   const message = `Bonjour ${prenom}, merci pour votre visite chez ${nomPro} ! Pouvez-vous nous laisser un avis Google ? ${lienGoogle} - STOP SMS`;
 
   try {
-    const OvhApi  = require('ovh');
-    const ovh = OvhApi({
-      appKey:      process.env.OVH_APP_KEY,
-      appSecret:   process.env.OVH_APP_SECRET,
-      consumerKey: process.env.OVH_CONSUMER_KEY,
-      endpoint:    'ovh-eu'
-    });
+    const ovh = getOvhClient();
 
-    // Récupère le nom du service SMS automatiquement
-    const services = await new Promise((resolve, reject) => {
-      ovh.request('GET', '/sms', (err, result) => err ? reject(err) : resolve(result));
-    });
-    const serviceName = services[0];
+    const services = await ovhRequest(ovh, 'GET', '/sms');
+    const serviceName = services?.[0];
     if (!serviceName) throw new Error('Aucun service SMS OVH trouvé');
 
-    await new Promise((resolve, reject) => {
-      ovh.request('POST', `/sms/${serviceName}/jobs`, {
-        charset:           'UTF-8',
-        coding:            '7bit',
-        message,
-        noStopClause:      false,
-        priority:          'high',
-        receivers:         [telephone],
-        senderForResponse: false,
-        validityPeriod:    2880
-      }, (err, result) => err ? reject(err) : resolve(result));
+    const result = await ovhRequest(ovh, 'POST', `/sms/${serviceName}/jobs`, {
+      charset:           'UTF-8',
+      coding:            '7bit',
+      message,
+      noStopClause:      false,
+      priority:          'high',
+      receivers:         [telephone],
+      senderForResponse: false,
+      validityPeriod:    2880
     });
 
+    console.log(`📱 SMS envoyé via OVH à ${telephone}`, result);
     return res.status(200).json({ success: true, message: 'SMS envoyé avec succès via OVH.' });
   } catch (err) {
-    return res.status(500).json({ success: false, error: "Erreur lors de l'envoi du SMS.", details: typeof err === 'object' ? JSON.stringify(err) : String(err) });
+    const details = err.statusCode
+      ? `HTTP ${err.statusCode} — ${JSON.stringify(err.body)}`
+      : String(err);
+    console.error(`❌ Erreur SMS OVH : ${details}`);
+    return res.status(500).json({ success: false, error: "Erreur lors de l'envoi du SMS.", details });
   }
 });
 

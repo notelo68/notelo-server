@@ -28,7 +28,7 @@
 | Base de données | Supabase (PostgreSQL) | yynlliuikeagpvvxdyif.supabase.co |
 | Paiements | Stripe (live) | Abonnements récurrents |
 | Email | Resend API | depuis onboarding@resend.dev (temporaire) |
-| SMS | ClickSend API | Pour l'envoi des SMS aux clients |
+| SMS | OVH SMS API | Pour l'envoi des SMS aux clients |
 | Hébergement backend | Render (free plan) | Auto-sleep après inactivité |
 | Hébergement frontend | Netlify | Connecté au repo `notelo68/notelo` |
 | DNS / Domaine | OVH | notelo.eu |
@@ -102,9 +102,9 @@
 | `LOGIN_URL` | `https://notelo.eu/login.html` | ✅ Configuré |
 | `DASHBOARD_URL` | `https://notelo.eu/login.html` | ✅ Configuré |
 | `MAINTENANCE_MODE` | `false` | ✅ Configuré |
-| `CLICKSEND_USERNAME` | `appdcontactpro@gmail.com` | ✅ Configuré |
-| `CLICKSEND_API_KEY` | `D24D3F6E-...` | ✅ Configuré |
-| `EMAIL_PASS` | `tipt czxh eozk hwse` | ✅ Configuré (non utilisé, Resend prioritaire) |
+| `OVH_APP_KEY` | `7fb88ee9...` | ✅ Configuré |
+| `OVH_APP_SECRET` | `c692012d...` | ✅ Configuré |
+| `OVH_CONSUMER_KEY` | `5e375b3d...` | ⚠️ À vérifier (403 en cours) |
 
 ---
 
@@ -119,23 +119,29 @@
 ## 7. Ce qui reste à faire
 
 ### 🔴 Important
-1. **Email pro** : configurer `contact@notelo.eu` sur OVH → vérifier le domaine `notelo.eu` sur Resend → changer `RESEND_FROM` à `contact@notelo.eu` sur Render. Actuellement les emails partent depuis `onboarding@resend.dev`.
+1. **Fixer OVH SMS 403** : L'API OVH retourne une erreur 403. Cause probable = Consumer Key pas validée (OVH envoie un lien de validation après création du token). Solution : aller sur https://eu.api.ovh.com/createToken et créer un nouveau token avec ces droits :
+   - `GET /sms` 
+   - `GET /sms/*`
+   - `POST /sms/*/jobs`
+   Puis mettre à jour `OVH_CONSUMER_KEY` sur Render. Route de diagnostic disponible : `GET /admin/test-ovh`
 
-2. **Tester un vrai paiement** de bout en bout : payer → recevoir l'email → se connecter au dashboard avec le code `NOTELO-XXXX`.
+2. **Email pro** : configurer `contact@notelo.eu` sur OVH → vérifier le domaine `notelo.eu` sur Resend → changer `RESEND_FROM` à `contact@notelo.eu` sur Render. Actuellement les emails partent depuis `onboarding@resend.dev`.
 
-3. **Configurer `success_url` dans Stripe** : dans le Stripe Dashboard, le lien de paiement doit rediriger vers `https://notelo-server.onrender.com/payment-success` après paiement.
+3. **Tester un vrai paiement** de bout en bout : payer → recevoir l'email → se connecter au dashboard avec le code `NOTELO-XXXX`.
+
+4. **Configurer `success_url` dans Stripe** : dans le Stripe Dashboard, le lien de paiement doit rediriger vers `https://notelo-server.onrender.com/payment-success` après paiement.
 
 ### 🟡 Moyen terme
-4. **Section contact** sur la landing page `notelo.eu` : formulaire qui envoie les messages à `appdcontactpro@gmail.com` (temporaire) puis `contact@notelo.eu`.
+5. **Section contact** sur la landing page `notelo.eu` : formulaire qui envoie les messages à `appdcontactpro@gmail.com` (temporaire) puis `contact@notelo.eu`.
 
-5. **Upgrade Render** : le plan gratuit met le serveur en veille après 15 min d'inactivité → délai de 50-60 sec au réveil. Pour la prod, passer au plan payant ($7/mois).
+6. **Upgrade Render** : le plan gratuit met le serveur en veille après 15 min d'inactivité → délai de 50-60 sec au réveil. Pour la prod, passer au plan payant ($7/mois).
 
-6. **Dashboard client** : ce que les utilisateurs voient après connexion (envoyer des SMS, voir les stats, historique).
+7. **Dashboard client** : ce que les utilisateurs voient après connexion (envoyer des SMS, voir les stats, historique).
 
 ### 🟢 Plus tard
-7. **Vrai système d'authentification** : actuellement le code `NOTELO-XXXX` est stocké hashé en BDD mais la vérification côté login n'est pas encore connectée au backend.
+8. **Vrai système d'authentification** : actuellement le code `NOTELO-XXXX` est stocké hashé en BDD mais la vérification côté login n'est pas encore connectée au backend.
 
-8. **Historique SMS** : table Supabase pour tracker les SMS envoyés par chaque client.
+9. **Historique SMS** : table Supabase pour tracker les SMS envoyés par chaque client.
 
 ---
 
@@ -204,4 +210,12 @@ curl -X POST https://notelo-server.onrender.com/admin/maintenance \
 - Annulation abonnement via Stripe Customer Portal
 - Création `CLAUDE.md` pour mise à jour automatique du doc
 
-*Dernière mise à jour : 06/04/2026*
+### Session 10/04/2026
+- Remplacement ClickSend par OVH SMS API (`POST /send-sms`)
+- Amélioration capture d'erreur OVH : affiche maintenant `HTTP 403 — <corps>` au lieu de juste `403`
+- Ajout route `GET /admin/test-ovh` pour diagnostiquer la connexion OVH pas à pas
+- Refactoring : helpers `getOvhClient()` et `ovhRequest()` pour réutilisation
+- Mise à jour de la documentation (ClickSend → OVH, variables d'env)
+- **Bug en cours** : OVH retourne 403 — Consumer Key probablement pas validée
+
+*Dernière mise à jour : 10/04/2026*
