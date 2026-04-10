@@ -154,8 +154,11 @@ app.post('/send-sms', async (req, res) => {
 // Endpoint de diagnostic OVH
 app.get('/test-ovh', async (req, res) => {
   try {
-    const services = await ovhRequest('GET', '/sms');
-    return res.json({ success: true, services });
+    const [service, senders] = await Promise.all([
+      ovhRequest('GET', `/sms/${OVH_SMS_SERVICE}`),
+      ovhRequest('GET', `/sms/${OVH_SMS_SERVICE}/senders`)
+    ]);
+    return res.json({ success: true, service, senders });
   } catch (err) {
     const status = err.response?.status;
     const detail = err.response?.data || err.message;
