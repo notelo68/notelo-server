@@ -3,6 +3,7 @@ const express = require('express');
 const axios   = require('axios');
 const fs      = require('fs');
 const path    = require('path');
+const twilio  = require('twilio');
 
 const app = express();
 app.use(express.json());
@@ -15,6 +16,13 @@ app.use((req, res, next) => {
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
+
+// ─── TWILIO ───
+const twilioClient = twilio(
+  process.env.TWILIO_ACCOUNT_SID,
+  process.env.TWILIO_AUTH_TOKEN
+);
+const TWILIO_FROM = process.env.TWILIO_FROM; // numéro Twilio ex: +15822633317
 
 // ─── PERSISTANCE LIENS RACCOURCIS ───
 const LINKS_FILE = path.join(__dirname, 'links.json');
@@ -47,7 +55,6 @@ app.post('/shorten', (req, res) => {
   const links = readLinks();
   const BASE_URL = process.env.BASE_URL || 'https://notelo-server.onrender.com';
 
-  // Réutiliser un code existant si l'URL est déjà connue
   const existing = Object.entries(links).find(([, data]) => data.url === url);
   if (existing) {
     return res.json({ success: true, short: `${BASE_URL}/r/${existing[0]}` });
@@ -78,47 +85,14 @@ function readMessages() {
   try {
     if (!fs.existsSync(MESSAGES_FILE)) return [];
     return JSON.parse(fs.readFileSync(MESSAGES_FILE, 'utf8'));
-  } catch (e) {
-    return [];
-  }
+  } catch (e) { return []; }
 }
 
 function writeMessages(messages) {
   fs.writeFileSync(MESSAGES_FILE, JSON.stringify(messages, null, 2), 'utf8');
 }
 
-const crypto = require('crypto');
-
-const OVH_BASE    = 'https://eu.api.ovh.com/1.0';
-const OVH_SMS_SERVICE = process.env.OVH_SMS_SERVICE;
-
-async function ovhRequest(method, path, body = null) {
-  const APP_KEY      = process.env.OVH_APP_KEY;
-  const APP_SECRET   = process.env.OVH_APP_SECRET;
-  const CONSUMER_KEY = process.env.OVH_CONSUMER_KEY;
-
-  // Timestamp OVH (synchronisé)
-  const tsRes   = await axios.get(`${OVH_BASE}/auth/time`);
-  const timestamp = tsRes.data;
-
-  const fullUrl  = `${OVH_BASE}${path}`;
-  const bodyStr  = body ? JSON.stringify(body) : '';
-
-  const sigData  = `${APP_SECRET}+${CONSUMER_KEY}+${method}+${fullUrl}+${bodyStr}+${timestamp}`;
-  const signature = '$1$' + crypto.createHash('sha1').update(sigData).digest('hex');
-
-  const headers = {
-    'Content-Type':    'application/json',
-    'X-Ovh-Application': APP_KEY,
-    'X-Ovh-Consumer':    CONSUMER_KEY,
-    'X-Ovh-Signature':   signature,
-    'X-Ovh-Timestamp':   String(timestamp)
-  };
-
-  const response = await axios({ method, url: fullUrl, headers, data: body || undefined });
-  return response.data;
-}
-
+// ─── POST /send-sms ───
 app.post('/send-sms', async (req, res) => {
   const { prenom, telephone, nomPro, lienGoogle } = req.body;
 
@@ -132,38 +106,18 @@ app.post('/send-sms', async (req, res) => {
   const message = `Bonjour ${prenom}, merci pour votre visite chez ${nomPro} ! Pouvez-vous nous laisser un avis Google ? ${lienGoogle} - STOP SMS`;
 
   try {
-    const result = await ovhRequest('POST', `/sms/${OVH_SMS_SERVICE}/jobs`, {
-      message,
-      receivers:        [telephone],
-      senderForResponse: true,
-      noStopClause:     false,
-      priority:         'high',
-      charset:          'UTF-8'
+    const result = await twilioClient.messages.create({
+      body: message,
+      from: TWILIO_FROM,
+      to:   telephone
     });
 
-    console.log('✅ SMS envoyé :', result);
-    return res.status(200).json({ success: true, message: 'SMS envoyé avec succès.', details: result });
+    console.log(`✅ SMS envoyé à ${telephone} — SID: ${result.sid}`);
+    return res.status(200).json({ success: true, message: 'SMS envoyé avec succès.', sid: result.sid });
 
   } catch (err) {
-    const status  = err.response?.status;
-    const detail  = err.response?.data || err.message;
-    console.error(`❌ Erreur OVH SMS [${status}] :`, JSON.stringify(detail));
-    return res.status(500).json({ success: false, error: `Erreur OVH [${status}]`, details: detail });
-  }
-});
-
-// Endpoint de diagnostic OVH
-app.get('/test-ovh', async (req, res) => {
-  try {
-    const [service, senders] = await Promise.all([
-      ovhRequest('GET', `/sms/${OVH_SMS_SERVICE}`),
-      ovhRequest('GET', `/sms/${OVH_SMS_SERVICE}/senders`)
-    ]);
-    return res.json({ success: true, service, senders });
-  } catch (err) {
-    const status = err.response?.status;
-    const detail = err.response?.data || err.message;
-    return res.status(500).json({ success: false, error: `OVH [${status}]`, details: detail });
+    console.error(`❌ Erreur Twilio [${err.code}] :`, err.message);
+    return res.status(500).json({ success: false, error: `Erreur Twilio [${err.code}]`, details: err.message });
   }
 });
 
@@ -187,7 +141,7 @@ app.post('/messages', (req, res) => {
   };
 
   const messages = readMessages();
-  messages.unshift(message);           // plus récent en premier
+  messages.unshift(message);
   writeMessages(messages);
 
   console.log(`📩 Nouveau message de ${message.fromName} (${message.from}) — "${message.subject}"`);
@@ -199,11 +153,10 @@ app.get('/messages', (req, res) => {
   if (req.query.admin !== '1') {
     return res.status(403).json({ success: false, error: 'Accès refusé.' });
   }
-
   const messages = readMessages();
   return res.status(200).json(messages);
 });
 
 app.listen(3000, () => {
-  console.log('Serveur démarré sur le port 3000');
+  console.log('🚀 Serveur Notelo démarré sur le port 3000');
 });
