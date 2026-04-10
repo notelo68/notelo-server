@@ -134,10 +134,11 @@ app.post('/send-sms', async (req, res) => {
   try {
     const result = await ovhRequest('POST', `/sms/${OVH_SMS_SERVICE}/jobs`, {
       message,
-      receivers:    [telephone],
-      noStopClause: false,
-      priority:     'high',
-      charset:      'UTF-8'
+      receivers:        [telephone],
+      senderForResponse: true,
+      noStopClause:     false,
+      priority:         'high',
+      charset:          'UTF-8'
     });
 
     console.log('✅ SMS envoyé :', result);
