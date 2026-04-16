@@ -3,7 +3,6 @@ const express = require('express');
 const axios   = require('axios');
 const fs      = require('fs');
 const path    = require('path');
-const twilio  = require('twilio');
 
 const app = express();
 app.use(express.json());
@@ -17,12 +16,9 @@ app.use((req, res, next) => {
   next();
 });
 
-// ─── TWILIO ───
-const twilioClient = twilio(
-  process.env.TWILIO_ACCOUNT_SID,
-  process.env.TWILIO_AUTH_TOKEN
-);
-const TWILIO_FROM = process.env.TWILIO_FROM; // numéro Twilio ex: +15822633317
+// ─── BREVO ───
+const BREVO_API_KEY = process.env.BREVO_API_KEY;
+const BREVO_SENDER  = process.env.BREVO_SENDER || 'Notelo';
 
 // ─── PERSISTANCE LIENS RACCOURCIS ───
 const LINKS_FILE = path.join(__dirname, 'links.json');
@@ -106,18 +102,30 @@ app.post('/send-sms', async (req, res) => {
   const message = `Bonjour ${prenom}, merci pour votre visite chez ${nomPro} ! Pouvez-vous nous laisser un avis Google ? ${lienGoogle} - STOP SMS`;
 
   try {
-    const result = await twilioClient.messages.create({
-      body: message,
-      from: TWILIO_FROM,
-      to:   telephone
-    });
+    const result = await axios.post(
+      'https://api.brevo.com/v3/transactionalSMS/sms',
+      {
+        sender:    BREVO_SENDER,
+        recipient: telephone,
+        content:   message,
+        type:      'transactional'
+      },
+      {
+        headers: {
+          'api-key':      BREVO_API_KEY,
+          'Content-Type': 'application/json',
+          'Accept':       'application/json'
+        }
+      }
+    );
 
-    console.log(`✅ SMS envoyé à ${telephone} — SID: ${result.sid}`);
-    return res.status(200).json({ success: true, message: 'SMS envoyé avec succès.', sid: result.sid });
+    console.log(`✅ SMS envoyé à ${telephone} — messageId: ${result.data.messageId}`);
+    return res.status(200).json({ success: true, message: 'SMS envoyé avec succès.', messageId: result.data.messageId });
 
   } catch (err) {
-    console.error(`❌ Erreur Twilio [${err.code}] :`, err.message);
-    return res.status(500).json({ success: false, error: `Erreur Twilio [${err.code}]`, details: err.message });
+    const errData = err.response?.data || err.message;
+    console.error(`❌ Erreur Brevo :`, errData);
+    return res.status(500).json({ success: false, error: 'Erreur Brevo', details: errData });
   }
 });
 
