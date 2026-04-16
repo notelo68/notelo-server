@@ -18,7 +18,7 @@ const BREVO_API_KEY = process.env.BREVO_API_KEY;
 const BREVO_SENDER  = process.env.BREVO_SENDER || 'Notelo';
 
 // ─── STRIPE WEBHOOK (raw body — doit être AVANT express.json) ───
-app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+app.post('/webhook/stripe', express.raw({ type: 'application/json' }), async (req, res) => {
   const sig = req.headers['stripe-signature'];
   let event;
 
