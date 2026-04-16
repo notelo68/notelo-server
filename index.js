@@ -31,38 +31,36 @@ app.post('/webhook/stripe', express.raw({ type: 'application/json' }), async (re
 
   if (event.type === 'checkout.session.completed') {
     const session = event.data.object;
-    const email = session.customer_email || session.customer_details?.email;
+    const email   = session.customer_email || session.customer_details?.email;
+    const amount  = session.amount_total; // centimes
 
-    console.log(`💳 Paiement confirmé pour ${email}`);
+    const planKey = amount <= 2900 ? 'starter' : amount <= 4900 ? 'pro' : 'business';
+    const plans = {
+      starter:  { name: 'Starter',  limit: '50 SMS/mois',   price: '29€' },
+      pro:      { name: 'Pro',      limit: '200 SMS/mois',  price: '49€' },
+      business: { name: 'Business', limit: 'SMS illimités', price: '89€' }
+    };
+    const plan = plans[planKey];
 
-    // Activer l'abonnement dans Supabase
-    const { error } = await supabase
-      .from('profiles')
-      .update({
-        is_pro:                  true,
-        subscription_status:     'active',
-        stripe_customer_id:      session.customer,
-        stripe_subscription_id:  session.subscription
-      })
-      .eq('email', email);
-
-    if (error) console.error('❌ Supabase update error:', error.message);
-    else console.log(`✅ Profil activé dans Supabase pour ${email}`);
+    console.log(`💳 Paiement confirmé pour ${email} — plan ${planKey} (${amount / 100}€)`);
 
     // Email de bienvenue via Brevo
     try {
       await axios.post('https://api.brevo.com/v3/smtp/email', {
-        sender:      { name: 'Notelo', email: 'noreply@notelo.eu' },
+        sender:      { name: 'Notelo', email: 'contact@notelo.eu' },
         to:          [{ email }],
-        subject:     'Bienvenue sur Notelo Pro !',
+        subject:     `Bienvenue sur Notelo ${plan.name} !`,
         htmlContent: `
-          <div style="font-family:sans-serif;max-width:600px;margin:auto">
-            <h2>Bienvenue sur Notelo Pro !</h2>
-            <p>Votre abonnement est maintenant actif. Vous pouvez accéder à votre dashboard et commencer à envoyer des avis Google à vos clients.</p>
-            <a href="https://notelo.eu/dashboard" style="display:inline-block;margin-top:16px;padding:12px 24px;background:#000;color:#fff;border-radius:8px;text-decoration:none">
-              Accéder au dashboard
+          <div style="font-family:sans-serif;max-width:600px;margin:auto;padding:32px">
+            <h2 style="color:#7c3aed">Bienvenue sur Notelo ${plan.name} !</h2>
+            <p>Votre abonnement est actif. Vous bénéficiez de <strong>${plan.limit}</strong> pour <strong>${plan.price}/mois</strong>.</p>
+            <a href="https://notelo.eu/dashboard.html"
+               style="display:inline-block;margin-top:16px;padding:12px 24px;background:#7c3aed;color:#fff;border-radius:8px;text-decoration:none">
+              Accéder au tableau de bord →
             </a>
-            <p style="margin-top:32px;color:#888;font-size:12px">Notelo — Automatisez vos avis Google</p>
+            <p style="margin-top:32px;color:#888;font-size:13px">
+              Des questions ? <a href="mailto:contact@notelo.eu">contact@notelo.eu</a>
+            </p>
           </div>
         `
       }, {
@@ -90,29 +88,82 @@ app.use((req, res, next) => {
 
 // ─── PAGE BIENVENUE (après paiement Stripe) ───
 app.get('/bienvenue', (req, res) => {
+  const planKey = req.query.plan || 'pro';
+  const plans = {
+    starter:  { name: 'Starter',  limit: '50 SMS/mois',   emoji: '🚀', color: '#6366f1' },
+    pro:      { name: 'Pro',      limit: '200 SMS/mois',  emoji: '⚡', color: '#7c3aed' },
+    business: { name: 'Business', limit: 'SMS illimités', emoji: '🏢', color: '#0ea5e9' }
+  };
+  const p = plans[planKey] || plans.pro;
+
   res.send(`<!DOCTYPE html>
 <html lang="fr">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Bienvenue sur Notelo Pro</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Bienvenue sur Notelo ${p.name} !</title>
   <style>
-    * { margin: 0; padding: 0; box-sizing: border-box; }
-    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f9f9f9; display: flex; align-items: center; justify-content: center; min-height: 100vh; }
-    .card { background: #fff; border-radius: 16px; padding: 48px 40px; text-align: center; max-width: 480px; width: 90%; box-shadow: 0 4px 24px rgba(0,0,0,0.08); }
-    .check { font-size: 56px; margin-bottom: 24px; }
-    h1 { font-size: 28px; margin-bottom: 12px; }
-    p { color: #555; line-height: 1.6; margin-bottom: 32px; }
-    a { display: inline-block; background: #000; color: #fff; padding: 14px 32px; border-radius: 10px; text-decoration: none; font-weight: 600; }
-    a:hover { background: #333; }
+    * { margin:0; padding:0; box-sizing:border-box; }
+    body {
+      font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+      background:linear-gradient(135deg,#f5f3ff 0%,#ede9fe 100%);
+      min-height:100vh;
+      display:flex;
+      align-items:center;
+      justify-content:center;
+      padding:24px;
+    }
+    .card {
+      background:#fff;
+      border-radius:20px;
+      padding:48px 40px;
+      max-width:520px;
+      width:100%;
+      text-align:center;
+      box-shadow:0 20px 60px rgba(124,58,237,0.12);
+    }
+    .emoji { font-size:64px; margin-bottom:16px; }
+    .badge {
+      display:inline-block;
+      background:${p.color}18;
+      color:${p.color};
+      border:1px solid ${p.color}40;
+      border-radius:999px;
+      padding:6px 18px;
+      font-size:14px;
+      font-weight:600;
+      margin-bottom:24px;
+    }
+    h1 { font-size:28px; color:#1e1b4b; margin-bottom:12px; }
+    .desc { color:#6b7280; line-height:1.6; margin-bottom:8px; }
+    .highlight { color:${p.color}; font-weight:700; font-size:18px; margin:8px 0; }
+    .cta {
+      display:inline-block;
+      margin-top:32px;
+      padding:14px 32px;
+      background:${p.color};
+      color:#fff;
+      border-radius:12px;
+      text-decoration:none;
+      font-weight:600;
+      font-size:16px;
+    }
+    .footer { margin-top:28px; font-size:13px; color:#9ca3af; }
+    .footer a { color:${p.color}; text-decoration:none; }
   </style>
 </head>
 <body>
   <div class="card">
-    <div class="check">✅</div>
-    <h1>Bienvenue sur Notelo Pro !</h1>
-    <p>Votre abonnement est activé. Vous allez recevoir un email de confirmation.<br>Vous pouvez maintenant accéder à votre dashboard.</p>
-    <a href="https://notelo.eu/dashboard">Accéder au dashboard</a>
+    <div class="emoji">${p.emoji}</div>
+    <div class="badge">Plan ${p.name} activé</div>
+    <h1>Bienvenue sur Notelo !</h1>
+    <p class="desc">Votre abonnement est actif. Vous disposez de</p>
+    <p class="highlight">${p.limit}</p>
+    <p class="desc">Un email de confirmation vous a été envoyé.</p>
+    <a href="https://notelo.eu/dashboard.html" class="cta">Accéder au tableau de bord →</a>
+    <div class="footer">
+      Une question ? <a href="mailto:contact@notelo.eu">contact@notelo.eu</a>
+    </div>
   </div>
 </body>
 </html>`);
