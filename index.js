@@ -3,11 +3,83 @@ const express = require('express');
 const axios   = require('axios');
 const fs      = require('fs');
 const path    = require('path');
+const stripe  = require('stripe')(process.env.STRIPE_SECRET_KEY);
+const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
+
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY
+);
+
+// ─── BREVO ───
+const BREVO_API_KEY = process.env.BREVO_API_KEY;
+const BREVO_SENDER  = process.env.BREVO_SENDER || 'Notelo';
+
+// ─── STRIPE WEBHOOK (raw body — doit être AVANT express.json) ───
+app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  const sig = req.headers['stripe-signature'];
+  let event;
+
+  try {
+    event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
+  } catch (err) {
+    console.error('❌ Signature webhook invalide:', err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  if (event.type === 'checkout.session.completed') {
+    const session = event.data.object;
+    const email = session.customer_email || session.customer_details?.email;
+
+    console.log(`💳 Paiement confirmé pour ${email}`);
+
+    // Activer l'abonnement dans Supabase
+    const { error } = await supabase
+      .from('profiles')
+      .update({
+        is_pro:                  true,
+        subscription_status:     'active',
+        stripe_customer_id:      session.customer,
+        stripe_subscription_id:  session.subscription
+      })
+      .eq('email', email);
+
+    if (error) console.error('❌ Supabase update error:', error.message);
+    else console.log(`✅ Profil activé dans Supabase pour ${email}`);
+
+    // Email de bienvenue via Brevo
+    try {
+      await axios.post('https://api.brevo.com/v3/smtp/email', {
+        sender:      { name: 'Notelo', email: 'noreply@notelo.eu' },
+        to:          [{ email }],
+        subject:     'Bienvenue sur Notelo Pro !',
+        htmlContent: `
+          <div style="font-family:sans-serif;max-width:600px;margin:auto">
+            <h2>Bienvenue sur Notelo Pro !</h2>
+            <p>Votre abonnement est maintenant actif. Vous pouvez accéder à votre dashboard et commencer à envoyer des avis Google à vos clients.</p>
+            <a href="https://notelo.eu/dashboard" style="display:inline-block;margin-top:16px;padding:12px 24px;background:#000;color:#fff;border-radius:8px;text-decoration:none">
+              Accéder au dashboard
+            </a>
+            <p style="margin-top:32px;color:#888;font-size:12px">Notelo — Automatisez vos avis Google</p>
+          </div>
+        `
+      }, {
+        headers: { 'api-key': BREVO_API_KEY, 'Content-Type': 'application/json' }
+      });
+      console.log(`📧 Email de bienvenue envoyé à ${email}`);
+    } catch (err) {
+      console.error('❌ Erreur email Brevo:', err.response?.data || err.message);
+    }
+  }
+
+  res.json({ received: true });
+});
+
+// ─── MIDDLEWARES ───
 app.use(express.json());
 
-// CORS
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -16,9 +88,35 @@ app.use((req, res, next) => {
   next();
 });
 
-// ─── BREVO ───
-const BREVO_API_KEY = process.env.BREVO_API_KEY;
-const BREVO_SENDER  = process.env.BREVO_SENDER || 'Notelo';
+// ─── PAGE BIENVENUE (après paiement Stripe) ───
+app.get('/bienvenue', (req, res) => {
+  res.send(`<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Bienvenue sur Notelo Pro</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f9f9f9; display: flex; align-items: center; justify-content: center; min-height: 100vh; }
+    .card { background: #fff; border-radius: 16px; padding: 48px 40px; text-align: center; max-width: 480px; width: 90%; box-shadow: 0 4px 24px rgba(0,0,0,0.08); }
+    .check { font-size: 56px; margin-bottom: 24px; }
+    h1 { font-size: 28px; margin-bottom: 12px; }
+    p { color: #555; line-height: 1.6; margin-bottom: 32px; }
+    a { display: inline-block; background: #000; color: #fff; padding: 14px 32px; border-radius: 10px; text-decoration: none; font-weight: 600; }
+    a:hover { background: #333; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="check">✅</div>
+    <h1>Bienvenue sur Notelo Pro !</h1>
+    <p>Votre abonnement est activé. Vous allez recevoir un email de confirmation.<br>Vous pouvez maintenant accéder à votre dashboard.</p>
+    <a href="https://notelo.eu/dashboard">Accéder au dashboard</a>
+  </div>
+</body>
+</html>`);
+});
 
 // ─── PERSISTANCE LIENS RACCOURCIS ───
 const LINKS_FILE = path.join(__dirname, 'links.json');
