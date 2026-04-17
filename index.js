@@ -4,29 +4,15 @@ const axios   = require('axios');
 const fs      = require('fs');
 const path    = require('path');
 const stripe  = require('stripe')(process.env.STRIPE_SECRET_KEY);
+const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
 
-// ─── CLIENTS (persistance JSON) ───
-const CLIENTS_FILE = path.join(__dirname, 'clients.json');
-
-function readClients() {
-  try {
-    if (!fs.existsSync(CLIENTS_FILE)) return {};
-    return JSON.parse(fs.readFileSync(CLIENTS_FILE, 'utf8'));
-  } catch (e) { return {}; }
-}
-
-function writeClients(clients) {
-  fs.writeFileSync(CLIENTS_FILE, JSON.stringify(clients, null, 2), 'utf8');
-}
-
-function generateClientCode() {
-  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-  let code = 'NOTELO-';
-  for (let i = 0; i < 6; i++) code += chars[Math.floor(Math.random() * chars.length)];
-  return code;
-}
+// ─── SUPABASE ───
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_KEY
+);
 
 // Comptes fixes (admin + démo) — ne passent pas par Stripe
 const FIXED_ACCOUNTS = {
@@ -54,6 +40,13 @@ const FIXED_ACCOUNTS = {
 const BREVO_API_KEY = process.env.BREVO_API_KEY;
 const BREVO_SENDER  = process.env.BREVO_SENDER || 'Notelo';
 
+function generateClientCode() {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  let code = 'NOTELO-';
+  for (let i = 0; i < 6; i++) code += chars[Math.floor(Math.random() * chars.length)];
+  return code;
+}
+
 // ─── STRIPE WEBHOOK (raw body — doit être AVANT express.json) ───
 app.post('/webhook/stripe', express.raw({ type: 'application/json' }), async (req, res) => {
   const sig = req.headers['stripe-signature'];
@@ -80,21 +73,26 @@ app.post('/webhook/stripe', express.raw({ type: 'application/json' }), async (re
     };
     const plan = planLabels[planKey];
 
-    // Créer ou récupérer le client
-    const clients = readClients();
-    let code = clients[email]?.code;
+    // Vérifier si le client existe déjà
+    const { data: existing } = await supabase
+      .from('clients')
+      .select('code')
+      .eq('email', email)
+      .maybeSingle();
+
+    let code = existing?.code;
     if (!code) {
       code = generateClientCode();
-      clients[email] = {
+      await supabase.from('clients').insert({
+        email,
         code,
-        plan:     planKey,
-        role:     'client',
-        nom:      nom.split(' ')[0] || '',
-        nomPro:   '',
-        lienGoogle: '',
-        joinDate: new Date().toISOString()
-      };
-      writeClients(clients);
+        plan:        planKey,
+        role:        'client',
+        nom:         nom.split(' ')[0] || '',
+        nom_pro:     '',
+        lien_google: '',
+        join_date:   new Date().toISOString()
+      });
       console.log(`✅ Nouveau client créé : ${email} — code ${code} — plan ${planKey}`);
     }
 
@@ -161,7 +159,7 @@ app.use((req, res, next) => {
 });
 
 // ─── POST /auth — vérification email + code ───
-app.post('/auth', (req, res) => {
+app.post('/auth', async (req, res) => {
   const email = (req.body.email || '').toLowerCase().trim();
   const code  = (req.body.code  || '').toUpperCase().trim();
 
@@ -175,11 +173,25 @@ app.post('/auth', (req, res) => {
     return res.json({ success: true, client: { email, ...fixed } });
   }
 
-  // Comptes clients (clients.json)
-  const clients = readClients();
-  const client  = clients[email];
-  if (client && client.code === code) {
-    return res.json({ success: true, client: { email, ...client } });
+  // Supabase
+  const { data: client } = await supabase
+    .from('clients')
+    .select('*')
+    .eq('email', email)
+    .eq('code', code)
+    .maybeSingle();
+
+  if (client) {
+    return res.json({ success: true, client: {
+      email,
+      code:       client.code,
+      plan:       client.plan,
+      role:       client.role,
+      nom:        client.nom,
+      nomPro:     client.nom_pro,
+      lienGoogle: client.lien_google,
+      joinDate:   client.join_date
+    }});
   }
 
   return res.status(401).json({ success: false, error: 'Email ou code incorrect.' });
@@ -242,20 +254,7 @@ app.get('/r/:code', (req, res) => {
 });
 
 // ─── MESSAGES CONTACT ───
-const MESSAGES_FILE = path.join(__dirname, 'messages.json');
-
-function readMessages() {
-  try {
-    if (!fs.existsSync(MESSAGES_FILE)) return [];
-    return JSON.parse(fs.readFileSync(MESSAGES_FILE, 'utf8'));
-  } catch (e) { return []; }
-}
-
-function writeMessages(messages) {
-  fs.writeFileSync(MESSAGES_FILE, JSON.stringify(messages, null, 2), 'utf8');
-}
-
-app.post('/messages', (req, res) => {
+app.post('/messages', async (req, res) => {
   const { from, fromName, fromBusiness, subject, content, timestamp } = req.body;
 
   if (!from || !subject || !content) {
@@ -263,29 +262,38 @@ app.post('/messages', (req, res) => {
   }
 
   const message = {
-    id:           Date.now().toString(),
-    from:         from.toLowerCase().trim(),
-    fromName:     fromName     || from,
-    fromBusiness: fromBusiness || '',
-    subject:      subject.trim(),
-    content:      content.trim(),
-    timestamp:    timestamp || new Date().toISOString(),
-    receivedAt:   new Date().toISOString()
+    id:            Date.now().toString(),
+    from:          from.toLowerCase().trim(),
+    from_name:     fromName     || from,
+    from_business: fromBusiness || '',
+    subject:       subject.trim(),
+    content:       content.trim(),
+    timestamp:     timestamp || new Date().toISOString(),
+    received_at:   new Date().toISOString()
   };
 
-  const messages = readMessages();
-  messages.unshift(message);
-  writeMessages(messages);
+  const { error } = await supabase.from('messages').insert(message);
+  if (error) {
+    console.error('❌ Erreur Supabase messages:', error.message);
+    return res.status(500).json({ success: false, error: 'Erreur base de données.' });
+  }
 
-  console.log(`📩 Message de ${message.fromName} (${message.from}) — "${message.subject}"`);
+  console.log(`📩 Message de ${message.from_name} (${message.from}) — "${message.subject}"`);
   return res.status(201).json({ success: true, id: message.id });
 });
 
-app.get('/messages', (req, res) => {
+app.get('/messages', async (req, res) => {
   if (req.query.admin !== '1') {
     return res.status(403).json({ success: false, error: 'Accès refusé.' });
   }
-  return res.status(200).json(readMessages());
+
+  const { data, error } = await supabase
+    .from('messages')
+    .select('*')
+    .order('received_at', { ascending: false });
+
+  if (error) return res.status(500).json({ success: false, error: error.message });
+  return res.status(200).json(data);
 });
 
 // ─── POST /send-sms ───
