@@ -11,7 +11,7 @@ const app = express();
 // ─── SUPABASE ───
 const supabase = createClient(
   process.env.SUPABASE_URL,
-  process.env.SUPABASE_KEY
+  process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
 // Comptes fixes (admin + démo) — ne passent pas par Stripe
