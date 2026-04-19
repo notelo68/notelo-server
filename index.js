@@ -202,6 +202,29 @@ app.get('/bienvenue', (req, res) => {
   return res.redirect(`https://notelo.eu/bienvenue.html?plan=${req.query.plan || 'pro'}`);
 });
 
+// ─── POST /create-portal-session ───
+app.post('/create-portal-session', async (req, res) => {
+  const email = (req.body.email || '').toLowerCase().trim();
+  if (!email) return res.status(400).json({ success: false, error: 'Email requis.' });
+
+  try {
+    const customers = await stripe.customers.list({ email, limit: 1 });
+    if (!customers.data.length) {
+      return res.status(404).json({ success: false, error: 'Aucun abonnement Stripe trouvé pour cet email.' });
+    }
+
+    const session = await stripe.billingPortal.sessions.create({
+      customer:   customers.data[0].id,
+      return_url: 'https://notelo.eu/dashboard.html',
+    });
+
+    return res.json({ success: true, url: session.url });
+  } catch (err) {
+    console.error('❌ Erreur portail Stripe:', err.message);
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 // ─── PERSISTANCE LIENS RACCOURCIS ───
 const LINKS_FILE = path.join(__dirname, 'links.json');
 
