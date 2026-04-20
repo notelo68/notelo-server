@@ -225,6 +225,36 @@ app.post('/create-portal-session', async (req, res) => {
   }
 });
 
+// ─── PERSISTANCE ÉTAT UTILISATEURS ───
+const STATES_FILE = path.join(__dirname, 'user_states.json');
+
+function readStates() {
+  try {
+    if (!fs.existsSync(STATES_FILE)) return {};
+    return JSON.parse(fs.readFileSync(STATES_FILE, 'utf8'));
+  } catch (e) { return {}; }
+}
+
+function writeStates(states) {
+  fs.writeFileSync(STATES_FILE, JSON.stringify(states, null, 2), 'utf8');
+}
+
+app.get('/load-state', (req, res) => {
+  const email = (req.query.email || '').toLowerCase().trim();
+  if (!email) return res.status(400).json({ success: false, error: 'email requis' });
+  const states = readStates();
+  return res.json({ success: true, state: states[email] || null });
+});
+
+app.post('/save-state', (req, res) => {
+  const { email, sentThisMonth, sentMonth, smsTemplate, useCustomTemplate, nomPro, lienGoogle } = req.body;
+  if (!email) return res.status(400).json({ success: false, error: 'email requis' });
+  const states = readStates();
+  states[email.toLowerCase().trim()] = { sentThisMonth, sentMonth, smsTemplate, useCustomTemplate, nomPro, lienGoogle, updatedAt: new Date().toISOString() };
+  writeStates(states);
+  return res.json({ success: true });
+});
+
 // ─── PERSISTANCE LIENS RACCOURCIS ───
 const LINKS_FILE = path.join(__dirname, 'links.json');
 
@@ -321,7 +351,7 @@ app.get('/messages', async (req, res) => {
 
 // ─── POST /send-sms ───
 app.post('/send-sms', async (req, res) => {
-  const { prenom, telephone, nomPro, lienGoogle } = req.body;
+  const { prenom, telephone, nomPro, lienGoogle, message: messageOverride } = req.body;
 
   if (!prenom || !telephone || !nomPro || !lienGoogle) {
     return res.status(400).json({
@@ -330,7 +360,7 @@ app.post('/send-sms', async (req, res) => {
     });
   }
 
-  const message = `Bonjour ${prenom}, merci pour votre visite chez ${nomPro} ! Pouvez-vous nous laisser un avis Google ? ${lienGoogle} - STOP SMS`;
+  const message = messageOverride || `Bonjour ${prenom} 👋 Merci pour votre visite chez ${nomPro} ! Votre avis nous aide — 30 sec : ${lienGoogle} STOP SMS`;
 
   try {
     const result = await axios.post(
