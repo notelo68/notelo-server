@@ -360,7 +360,7 @@ app.post('/send-sms', async (req, res) => {
     });
   }
 
-  const message = messageOverride || `Bonjour ${prenom} 👋 Merci pour votre visite chez ${nomPro} ! Votre avis nous aide — 30 sec : ${lienGoogle} STOP SMS`;
+  const message = messageOverride || `Bonjour ${prenom}, merci pour votre visite chez ${nomPro} ! Votre avis en 30 secondes nous ferait plaisir : ${lienGoogle} STOP SMS`;
 
   try {
     const result = await axios.post(
