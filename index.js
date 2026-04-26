@@ -307,6 +307,16 @@ app.get('/r/:code', (req, res) => {
 });
 
 // ─── MESSAGES CONTACT ───
+const ADMIN_NOTIFICATION_EMAIL = process.env.ADMIN_NOTIFICATION_EMAIL || 'contact@notelo.eu';
+
+function escapeHtml(str) {
+  return String(str || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
 app.post('/messages', async (req, res) => {
   const { from, fromName, fromBusiness, subject, content, timestamp } = req.body;
 
@@ -332,12 +342,73 @@ app.post('/messages', async (req, res) => {
   }
 
   console.log(`📩 Message de ${message.from_name} (${message.from}) — "${message.subject}"`);
+
+  // Notification email à l'admin (non bloquante)
+  axios.post('https://api.brevo.com/v3/smtp/email', {
+    sender:  { name: 'Notelo Contact', email: 'contact@notelo.eu' },
+    to:      [{ email: ADMIN_NOTIFICATION_EMAIL }],
+    replyTo: { email: message.from, name: message.from_name },
+    subject: `📩 Notelo — Nouveau message : ${message.subject}`,
+    htmlContent: `
+      <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;max-width:600px;margin:auto;padding:32px;background:#fff">
+        <div style="text-align:center;margin-bottom:24px">
+          <span style="font-size:1.5rem;font-weight:700;color:#1A1A18">note<span style="color:#1D9E75">lo</span></span>
+        </div>
+        <h2 style="color:#1A1A18;font-size:20px;margin-bottom:8px">📩 Nouveau message reçu</h2>
+        <p style="color:#6B6B64;margin-bottom:20px;font-size:14px">Via le formulaire de contact de notelo.eu</p>
+
+        <div style="background:#F9F7F3;border-radius:12px;padding:20px;margin-bottom:20px">
+          <table style="width:100%;border-collapse:collapse;font-size:14px">
+            <tr>
+              <td style="padding:6px 0;color:#6B6B64;width:110px">De</td>
+              <td style="padding:6px 0;font-weight:600;color:#1A1A18">${escapeHtml(message.from_name)}</td>
+            </tr>
+            <tr>
+              <td style="padding:6px 0;color:#6B6B64">Email</td>
+              <td style="padding:6px 0;font-weight:600;color:#1D9E75">
+                <a href="mailto:${escapeHtml(message.from)}" style="color:#1D9E75;text-decoration:none">${escapeHtml(message.from)}</a>
+              </td>
+            </tr>
+            ${message.from_business ? `
+            <tr>
+              <td style="padding:6px 0;color:#6B6B64">Entreprise</td>
+              <td style="padding:6px 0;color:#1A1A18">${escapeHtml(message.from_business)}</td>
+            </tr>` : ''}
+            <tr>
+              <td style="padding:6px 0;color:#6B6B64">Sujet</td>
+              <td style="padding:6px 0;font-weight:600;color:#1A1A18">${escapeHtml(message.subject)}</td>
+            </tr>
+          </table>
+        </div>
+
+        <div style="background:#fff;border:1.5px solid #EBEBEA;border-radius:12px;padding:20px;margin-bottom:24px">
+          <p style="font-size:12px;color:#6B6B64;margin-bottom:10px;text-transform:uppercase;letter-spacing:0.05em;font-weight:600">Message</p>
+          <p style="color:#1A1A18;font-size:14px;line-height:1.7;white-space:pre-wrap;margin:0">${escapeHtml(message.content)}</p>
+        </div>
+
+        <a href="mailto:${escapeHtml(message.from)}?subject=Re: ${encodeURIComponent(message.subject)}"
+           style="display:inline-block;padding:12px 28px;background:#1D9E75;color:#fff;border-radius:100px;text-decoration:none;font-weight:600;font-size:14px;margin-right:8px">
+          Répondre →
+        </a>
+        <a href="https://notelo.eu/admin-messages.html"
+           style="display:inline-block;padding:12px 28px;background:#fff;color:#1A1A18;border:1.5px solid #EBEBEA;border-radius:100px;text-decoration:none;font-weight:600;font-size:14px">
+          Voir tous les messages
+        </a>
+      </div>
+    `
+  }, {
+    headers: { 'api-key': BREVO_API_KEY, 'Content-Type': 'application/json' }
+  })
+  .then(() => console.log(`📧 Notification admin envoyée à ${ADMIN_NOTIFICATION_EMAIL}`))
+  .catch(err => console.error('⚠️  Notification admin échouée:', err.response?.data || err.message));
+
   return res.status(201).json({ success: true, id: message.id });
 });
 
 app.get('/messages', async (req, res) => {
-  if (req.query.admin !== '1') {
-    return res.status(403).json({ success: false, error: 'Accès refusé.' });
+  const adminKey = req.headers['x-admin-key'];
+  if (!process.env.ADMIN_PASSWORD || adminKey !== process.env.ADMIN_PASSWORD) {
+    return res.status(401).json({ success: false, error: 'Accès refusé.' });
   }
 
   const { data, error } = await supabase
