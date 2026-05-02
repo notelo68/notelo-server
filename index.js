@@ -225,34 +225,134 @@ app.post('/create-portal-session', async (req, res) => {
   }
 });
 
-// ─── PERSISTANCE ÉTAT UTILISATEURS ───
-const STATES_FILE = path.join(__dirname, 'user_states.json');
+// ─── PERSISTANCE ÉTAT UTILISATEURS (Supabase) ───
+const HISTORY_CAP = 1000;
+const PIN_REGEX = /^\d{4}$/;
 
-function readStates() {
-  try {
-    if (!fs.existsSync(STATES_FILE)) return {};
-    return JSON.parse(fs.readFileSync(STATES_FILE, 'utf8'));
-  } catch (e) { return {}; }
-}
-
-function writeStates(states) {
-  fs.writeFileSync(STATES_FILE, JSON.stringify(states, null, 2), 'utf8');
-}
-
-app.get('/load-state', (req, res) => {
+app.get('/load-state', async (req, res) => {
   const email = (req.query.email || '').toLowerCase().trim();
   if (!email) return res.status(400).json({ success: false, error: 'email requis' });
-  const states = readStates();
-  return res.json({ success: true, state: states[email] || null });
+
+  const { data, error } = await supabase
+    .from('user_states')
+    .select('*')
+    .eq('email', email)
+    .maybeSingle();
+
+  if (error) {
+    console.error('❌ load-state:', error.message);
+    return res.status(500).json({ success: false, error: error.message });
+  }
+  if (!data) return res.json({ success: true, state: null });
+
+  return res.json({ success: true, state: {
+    sentThisMonth:     data.sent_this_month || 0,
+    sentMonth:         data.sent_month || '',
+    smsTemplate:       data.sms_template || '',
+    useCustomTemplate: !!data.use_custom_template,
+    nomPro:            data.nom_pro || '',
+    lienGoogle:        data.lien_google || '',
+    history:           Array.isArray(data.history) ? data.history : [],
+    lockEnabled:       !!data.lock_enabled,
+    hasPin:            !!data.lock_pin,
+  }});
 });
 
-app.post('/save-state', (req, res) => {
-  const { email, sentThisMonth, sentMonth, smsTemplate, useCustomTemplate, nomPro, lienGoogle } = req.body;
+app.post('/save-state', async (req, res) => {
+  const {
+    email,
+    sentThisMonth, sentMonth, smsTemplate, useCustomTemplate, nomPro, lienGoogle,
+    history,
+    lockEnabled, newPin, currentPin,
+  } = req.body;
+
   if (!email) return res.status(400).json({ success: false, error: 'email requis' });
-  const states = readStates();
-  states[email.toLowerCase().trim()] = { sentThisMonth, sentMonth, smsTemplate, useCustomTemplate, nomPro, lienGoogle, updatedAt: new Date().toISOString() };
-  writeStates(states);
-  return res.json({ success: true });
+  const e = email.toLowerCase().trim();
+
+  const { data: current } = await supabase
+    .from('user_states')
+    .select('*')
+    .eq('email', e)
+    .maybeSingle();
+
+  const wasLocked = !!current?.lock_enabled;
+  const existingPin = current?.lock_pin || null;
+  const lienAttemptChange = lienGoogle !== undefined && (current?.lien_google || '') !== lienGoogle;
+  const lockToggleAttempt = lockEnabled !== undefined && lockEnabled !== wasLocked;
+  const pinChangeAttempt = newPin !== undefined;
+
+  // Si currentPin est fourni explicitement, le valider (utilisé pour vérifier le PIN sans modification réelle)
+  if (existingPin && currentPin !== undefined && currentPin !== existingPin) {
+    return res.status(403).json({ success: false, error: 'PIN incorrect' });
+  }
+
+  // Vérifications du PIN actuel pour les actions sensibles
+  const requiresCurrentPin = (
+    (wasLocked && lienAttemptChange) ||
+    (existingPin && lockToggleAttempt) ||
+    (existingPin && pinChangeAttempt)
+  );
+
+  if (requiresCurrentPin && currentPin !== existingPin) {
+    return res.status(403).json({ success: false, error: 'PIN incorrect' });
+  }
+
+  // Calcul des nouvelles valeurs lock
+  let nextPin = existingPin;
+  if (pinChangeAttempt) {
+    if (newPin && !PIN_REGEX.test(String(newPin))) {
+      return res.status(400).json({ success: false, error: 'PIN doit contenir 4 chiffres' });
+    }
+    nextPin = newPin || null;
+  }
+  let nextLockEnabled = wasLocked;
+  if (lockEnabled !== undefined) nextLockEnabled = !!lockEnabled;
+  if (nextLockEnabled && !nextPin) nextLockEnabled = false; // pas de verrou sans PIN
+
+  // Lien : refus silencieux si verrou actif et pas de PIN valide
+  let nextLien = current?.lien_google ?? null;
+  if (lienGoogle !== undefined) {
+    if (wasLocked && lienAttemptChange && currentPin !== existingPin) {
+      // ignore (déjà bloqué par le check requiresCurrentPin sauf si pas demandé — sécurité)
+    } else {
+      nextLien = lienGoogle;
+    }
+  }
+
+  // History server-authoritative — cap à HISTORY_CAP
+  let nextHistory = Array.isArray(current?.history) ? current.history : [];
+  if (Array.isArray(history)) {
+    nextHistory = history.slice(0, HISTORY_CAP);
+  }
+
+  const payload = {
+    email:               e,
+    sent_this_month:     sentThisMonth ?? current?.sent_this_month ?? 0,
+    sent_month:          sentMonth ?? current?.sent_month ?? null,
+    sms_template:        smsTemplate ?? current?.sms_template ?? null,
+    use_custom_template: useCustomTemplate ?? current?.use_custom_template ?? false,
+    nom_pro:             nomPro ?? current?.nom_pro ?? null,
+    lien_google:         nextLien,
+    history:             nextHistory,
+    lock_pin:            nextPin,
+    lock_enabled:        nextLockEnabled,
+    updated_at:          new Date().toISOString(),
+  };
+
+  const { error } = await supabase
+    .from('user_states')
+    .upsert(payload, { onConflict: 'email' });
+
+  if (error) {
+    console.error('❌ save-state:', error.message);
+    return res.status(500).json({ success: false, error: error.message });
+  }
+
+  return res.json({
+    success:     true,
+    lockEnabled: nextLockEnabled,
+    hasPin:      !!nextPin,
+  });
 });
 
 // ─── PERSISTANCE LIENS RACCOURCIS ───
