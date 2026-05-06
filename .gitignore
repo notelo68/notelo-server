@@ -1,0 +1,17 @@
+node_modules/
+.env
+.env.local
+.env.*.local
+
+# Données locales (volatiles sur Render — déjà migrées vers Supabase)
+links.json
+user_states.json
+clients.json
+messages.json
+
+# OS / IDE
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.log

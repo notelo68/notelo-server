@@ -1,8 +1,6 @@
 require('dotenv').config();
 const express = require('express');
 const axios   = require('axios');
-const fs      = require('fs');
-const path    = require('path');
 const stripe  = require('stripe')(process.env.STRIPE_SECRET_KEY);
 const { createClient } = require('@supabase/supabase-js');
 
@@ -47,6 +45,71 @@ function generateClientCode() {
   return code;
 }
 
+// ─── HELPERS ───
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+// Brevo SMS avec retry exponentiel (3 tentatives, 500ms / 1500ms)
+async function sendBrevoSms({ recipient, content }) {
+  const attempts = 3;
+  let lastErr;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      const result = await axios.post(
+        'https://api.brevo.com/v3/transactionalSMS/sms',
+        { sender: BREVO_SENDER, recipient, content, type: 'transactional' },
+        { headers: { 'api-key': BREVO_API_KEY, 'Content-Type': 'application/json', 'Accept': 'application/json' }, timeout: 10000 }
+      );
+      return result.data;
+    } catch (err) {
+      lastErr = err;
+      const status = err.response?.status;
+      // Pas de retry sur erreurs client définitives (4xx hors 408/429)
+      if (status && status >= 400 && status < 500 && status !== 408 && status !== 429) break;
+      if (i < attempts - 1) await sleep(500 * Math.pow(3, i));
+    }
+  }
+  throw lastErr;
+}
+
+// Détection du plan : priorité aux price IDs Stripe, fallback sur le montant
+async function detectPlan(session) {
+  const priceMap = {};
+  if (process.env.STRIPE_PRICE_STARTER)  priceMap[process.env.STRIPE_PRICE_STARTER]  = 'starter';
+  if (process.env.STRIPE_PRICE_PRO)      priceMap[process.env.STRIPE_PRICE_PRO]      = 'pro';
+  if (process.env.STRIPE_PRICE_BUSINESS) priceMap[process.env.STRIPE_PRICE_BUSINESS] = 'business';
+
+  if (Object.keys(priceMap).length > 0) {
+    try {
+      const full = await stripe.checkout.sessions.retrieve(session.id, { expand: ['line_items'] });
+      const priceId = full.line_items?.data?.[0]?.price?.id;
+      if (priceId && priceMap[priceId]) return priceMap[priceId];
+    } catch (e) {
+      console.warn('⚠️  detectPlan via line_items a échoué, fallback amount:', e.message);
+    }
+  }
+  const amount = session.amount_total ?? 0;
+  return amount <= 2900 ? 'starter' : amount <= 4900 ? 'pro' : 'business';
+}
+
+// Rate-limit en mémoire (1 instance Render — suffisant pour anti-brute-force basique)
+function makeRateLimiter({ windowMs, max }) {
+  const hits = new Map();
+  return (key) => {
+    const now = Date.now();
+    const entry = hits.get(key);
+    if (!entry || now - entry.start > windowMs) {
+      hits.set(key, { start: now, count: 1 });
+      return { ok: true };
+    }
+    entry.count += 1;
+    if (entry.count > max) {
+      return { ok: false, retryAfter: Math.ceil((entry.start + windowMs - now) / 1000) };
+    }
+    return { ok: true };
+  };
+}
+const authLimiter = makeRateLimiter({ windowMs: 60_000, max: 10 });
+
 // ─── STRIPE WEBHOOK (raw body — doit être AVANT express.json) ───
 app.post('/webhook/stripe', express.raw({ type: 'application/json' }), async (req, res) => {
   const sig = req.headers['stripe-signature'];
@@ -59,13 +122,24 @@ app.post('/webhook/stripe', express.raw({ type: 'application/json' }), async (re
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
+  if (event.type === 'customer.subscription.deleted') {
+    const sub = event.data.object;
+    console.warn(`⚠️  Abonnement Stripe annulé — customer ${sub.customer}, sub ${sub.id}`);
+    return res.json({ received: true });
+  }
+
+  if (event.type === 'invoice.payment_failed') {
+    const invoice = event.data.object;
+    console.warn(`⚠️  Paiement échoué — customer ${invoice.customer}, invoice ${invoice.id}, montant ${invoice.amount_due}`);
+    return res.json({ received: true });
+  }
+
   if (event.type === 'checkout.session.completed') {
     const session = event.data.object;
     const email   = (session.customer_email || session.customer_details?.email || '').toLowerCase();
     const nom     = session.customer_details?.name || '';
-    const amount  = session.amount_total;
 
-    const planKey = amount <= 2900 ? 'starter' : amount <= 4900 ? 'pro' : 'business';
+    const planKey = await detectPlan(session);
     const planLabels = {
       starter:  { name: 'Starter',  limit: '50 SMS/mois',   price: '29€/mois' },
       pro:      { name: 'Pro',      limit: '200 SMS/mois',  price: '49€/mois' },
@@ -150,8 +224,18 @@ app.post('/webhook/stripe', express.raw({ type: 'application/json' }), async (re
 // ─── MIDDLEWARES ───
 app.use(express.json());
 
+// CORS — whitelist via ALLOWED_ORIGINS (CSV). Si non défini, autorise toutes les origines (rétrocompat).
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '')
+  .split(',').map(s => s.trim()).filter(Boolean);
+
 app.use((req, res, next) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
+  const origin = req.headers.origin;
+  if (ALLOWED_ORIGINS.length === 0) {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+  } else if (origin && ALLOWED_ORIGINS.includes(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Vary', 'Origin');
+  }
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Admin-Key');
   if (req.method === 'OPTIONS') return res.sendStatus(204);
@@ -165,6 +249,14 @@ app.post('/auth', async (req, res) => {
 
   if (!email || !code) {
     return res.status(400).json({ success: false, error: 'Email et code requis.' });
+  }
+
+  // Anti brute-force : 10 tentatives / min par IP+email
+  const ip = req.headers['x-forwarded-for']?.split(',')[0].trim() || req.socket.remoteAddress || 'unknown';
+  const limit = authLimiter(`${ip}:${email}`);
+  if (!limit.ok) {
+    res.setHeader('Retry-After', String(limit.retryAfter));
+    return res.status(429).json({ success: false, error: `Trop de tentatives. Réessayez dans ${limit.retryAfter}s.` });
   }
 
   // Comptes fixes en priorité
@@ -355,53 +447,67 @@ app.post('/save-state', async (req, res) => {
   });
 });
 
-// ─── PERSISTANCE LIENS RACCOURCIS ───
-const LINKS_FILE = path.join(__dirname, 'links.json');
-
-function readLinks() {
-  try {
-    if (!fs.existsSync(LINKS_FILE)) return {};
-    return JSON.parse(fs.readFileSync(LINKS_FILE, 'utf8'));
-  } catch (e) { return {}; }
-}
-
-function writeLinks(links) {
-  fs.writeFileSync(LINKS_FILE, JSON.stringify(links, null, 2), 'utf8');
-}
-
-function generateCode() {
+// ─── PERSISTANCE LIENS RACCOURCIS (Supabase) ───
+function generateShortCode() {
   const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
   let code = '';
   for (let i = 0; i < 6; i++) code += chars[Math.floor(Math.random() * chars.length)];
   return code;
 }
 
-app.post('/shorten', (req, res) => {
+app.post('/shorten', async (req, res) => {
   const { url } = req.body;
-  if (!url || !url.startsWith('http')) {
+  if (!url || !/^https?:\/\//i.test(url)) {
     return res.status(400).json({ success: false, error: 'URL invalide' });
   }
 
-  const links    = readLinks();
   const BASE_URL = process.env.BASE_URL || 'https://notelo-server.onrender.com';
-  const existing = Object.entries(links).find(([, data]) => data.url === url);
 
+  // Déduplication : retourne le code existant si l'URL est déjà raccourcie
+  const { data: existing, error: selErr } = await supabase
+    .from('short_links')
+    .select('code')
+    .eq('url', url)
+    .maybeSingle();
+
+  if (selErr) {
+    console.error('❌ shorten select:', selErr.message);
+    return res.status(500).json({ success: false, error: 'Erreur base de données.' });
+  }
   if (existing) {
-    return res.json({ success: true, short: `${BASE_URL}/r/${existing[0]}` });
+    return res.json({ success: true, short: `${BASE_URL}/r/${existing.code}` });
   }
 
-  let code;
-  do { code = generateCode(); } while (links[code]);
-  links[code] = { url, createdAt: new Date().toISOString() };
-  writeLinks(links);
-
-  console.log(`🔗 Raccourci : ${BASE_URL}/r/${code} → ${url}`);
-  return res.status(201).json({ success: true, short: `${BASE_URL}/r/${code}` });
+  // Génère un code unique (max 5 essais en cas de collision)
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const code = generateShortCode();
+    const { error: insErr } = await supabase
+      .from('short_links')
+      .insert({ code, url });
+    if (!insErr) {
+      console.log(`🔗 Raccourci : ${BASE_URL}/r/${code} → ${url}`);
+      return res.status(201).json({ success: true, short: `${BASE_URL}/r/${code}` });
+    }
+    // 23505 = unique_violation (collision sur la clé primaire) → on retente
+    if (insErr.code !== '23505') {
+      console.error('❌ shorten insert:', insErr.message);
+      return res.status(500).json({ success: false, error: 'Erreur base de données.' });
+    }
+  }
+  return res.status(500).json({ success: false, error: 'Impossible de générer un code unique.' });
 });
 
-app.get('/r/:code', (req, res) => {
-  const links = readLinks();
-  const data  = links[req.params.code];
+app.get('/r/:code', async (req, res) => {
+  const { data, error } = await supabase
+    .from('short_links')
+    .select('url')
+    .eq('code', req.params.code)
+    .maybeSingle();
+
+  if (error) {
+    console.error('❌ /r select:', error.message);
+    return res.status(500).send('Erreur serveur.');
+  }
   if (!data) return res.status(404).send('Lien introuvable ou expiré.');
   return res.redirect(301, data.url);
 });
@@ -534,15 +640,9 @@ app.post('/send-sms', async (req, res) => {
   const message = messageOverride || `Bonjour ${prenom}, merci pour votre visite chez ${nomPro} ! Votre avis en 30 secondes nous ferait plaisir : ${lienGoogle} STOP SMS`;
 
   try {
-    const result = await axios.post(
-      'https://api.brevo.com/v3/transactionalSMS/sms',
-      { sender: BREVO_SENDER, recipient: telephone, content: message, type: 'transactional' },
-      { headers: { 'api-key': BREVO_API_KEY, 'Content-Type': 'application/json', 'Accept': 'application/json' } }
-    );
-
+    const data = await sendBrevoSms({ recipient: telephone, content: message });
     console.log(`✅ SMS envoyé à ${telephone}`);
-    return res.status(200).json({ success: true, message: 'SMS envoyé avec succès.', messageId: result.data.messageId });
-
+    return res.status(200).json({ success: true, message: 'SMS envoyé avec succès.', messageId: data.messageId });
   } catch (err) {
     const errData = err.response?.data || err.message;
     console.error('❌ Erreur Brevo SMS:', errData);
@@ -550,6 +650,20 @@ app.post('/send-sms', async (req, res) => {
   }
 });
 
-app.listen(3000, () => {
-  console.log('🚀 Serveur Notelo démarré sur le port 3000');
+// ─── GET /health — sanity-check pour Render et monitoring ───
+app.get('/health', async (req, res) => {
+  const checks = { server: 'ok', supabase: 'unknown' };
+  try {
+    const { error } = await supabase.from('clients').select('email', { head: true, count: 'exact' }).limit(1);
+    checks.supabase = error ? `error: ${error.message}` : 'ok';
+  } catch (e) {
+    checks.supabase = `error: ${e.message}`;
+  }
+  const healthy = Object.values(checks).every(v => v === 'ok');
+  return res.status(healthy ? 200 : 503).json({ healthy, checks, timestamp: new Date().toISOString() });
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`🚀 Serveur Notelo démarré sur le port ${PORT}`);
 });
