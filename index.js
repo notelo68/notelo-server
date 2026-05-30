@@ -197,6 +197,53 @@ app.post('/auth', async (req, res) => {
   return res.status(401).json({ success: false, error: 'Email ou code incorrect.' });
 });
 
+
+// ─── POST /resend-code — renvoi du code d'accès par email ───
+app.post('/resend-code', async (req, res) => {
+  const email = (req.body.email || '').toLowerCase().trim();
+  if (!email) return res.status(400).json({ success: false, message: 'Email manquant.' });
+
+  if (FIXED_ACCOUNTS[email]) {
+    return res.json({ success: false, message: 'Aucun compte trouvé avec cet email.' });
+  }
+
+  const { data: client, error } = await supabase
+    .from('clients')
+    .select('nom, code')
+    .eq('email', email)
+    .maybeSingle();
+
+  if (error || !client) {
+    return res.json({ success: false, message: 'Aucun compte trouvé avec cet email.' });
+  }
+
+  try {
+    await axios.post('https://api.brevo.com/v3/smtp/email', {
+      sender:      { name: 'Notelo', email: 'contact@notelo.eu' },
+      to:          [{ email, name: client.nom }],
+      subject:     "Votre code d'acces Notelo",
+      htmlContent: '<div style="font-family:sans-serif;max-width:520px;margin:auto;padding:32px">'
+        + '<div style="text-align:center;margin-bottom:28px"><span style="font-size:1.5rem;font-weight:700;color:#1A1A18">note<span style="color:#1D9E75">lo</span></span></div>'
+        + '<h2 style="color:#1A1A18;font-size:20px;margin-bottom:8px">Votre code d\'acces</h2>'
+        + '<p style="color:#6B6B64;font-size:14px;margin-bottom:24px">Bonjour ' + client.nom + ', voici votre code de connexion Notelo :</p>'
+        + '<div style="background:#F9F7F3;border-radius:12px;padding:20px 32px;text-align:center;margin-bottom:24px">'
+        + '<p style="font-size:13px;color:#6B6B64;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:8px;font-weight:600">Code d\'acces</p>'
+        + '<p style="font-size:2rem;font-weight:700;color:#1D9E75;letter-spacing:0.08em;margin:0">' + client.code + '</p>'
+        + '</div>'
+        + '<a href="https://notelo.eu/login.html" style="display:block;text-align:center;padding:14px 32px;background:#1D9E75;color:#fff;border-radius:100px;text-decoration:none;font-weight:600;font-size:15px;margin-bottom:24px">Acceder au dashboard →</a>'
+        + '<p style="color:#9CA3AF;font-size:12px;text-align:center">Si vous n\'avez pas demande ce renvoi, ignorez cet email.</p>'
+        + '</div>'
+    }, {
+      headers: { 'api-key': BREVO_API_KEY, 'Content-Type': 'application/json' }
+    });
+
+    console.log(`Email code renvoye a ${email}`);
+    return res.json({ success: true });
+  } catch (err) {
+    console.error('Erreur renvoi code:', err.response?.data || err.message);
+    return res.status(500).json({ success: false, message: "Erreur lors de l'envoi de l'email." });
+  }
+});
 // ─── GET /bienvenue ───
 app.get('/bienvenue', (req, res) => {
   return res.redirect(`https://notelo.eu/bienvenue.html?plan=${req.query.plan || 'pro'}`);
