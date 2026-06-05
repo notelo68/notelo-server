@@ -400,28 +400,80 @@ app.post('/save-state', async (req, res) => {
   });
 });
 
-// ─── LIENS RACCOURCIS (TinyURL — sans expiration, sans stockage) ───
+// ─── LIENS RACCOURCIS (maison — Supabase avec fallback mémoire) ───
+// Fallback en mémoire si la table Supabase n'existe pas encore
+const linksMemory = new Map();
+
+function generateCode() {
+  const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
+  let code = '';
+  for (let i = 0; i < 6; i++) code += chars[Math.floor(Math.random() * chars.length)];
+  return code;
+}
+
 app.post('/shorten', async (req, res) => {
   const { url } = req.body;
   if (!url || !url.startsWith('http')) {
     return res.status(400).json({ success: false, error: 'URL invalide' });
   }
+  const BASE_URL = process.env.BASE_URL || 'https://notelo-server.onrender.com';
 
+  // ── Essayer Supabase (persistant) ──
   try {
-    const response = await axios.get(
-      `https://tinyurl.com/api-create.php?url=${encodeURIComponent(url)}`,
-      { timeout: 8000 }
-    );
-    const short = response.data.trim();
-    if (short.startsWith('https://tinyurl.com') || short.startsWith('http://tinyurl.com')) {
-      console.log(`🔗 Raccourci TinyURL : ${short} → ${url}`);
-      return res.json({ success: true, short });
+    const { data: existing, error: findErr } = await supabase
+      .from('links').select('code').eq('url', url).maybeSingle();
+
+    if (!findErr) {
+      if (existing) {
+        return res.json({ success: true, short: `${BASE_URL}/r/${existing.code}` });
+      }
+      // Table OK, générer un code unique
+      let code;
+      for (let i = 0; i < 10; i++) {
+        const c = generateCode();
+        const { data: col } = await supabase.from('links').select('code').eq('code', c).maybeSingle();
+        if (!col) { code = c; break; }
+      }
+      if (!code) code = generateCode();
+
+      const { error: insertErr } = await supabase.from('links').insert({ code, url });
+      if (!insertErr) {
+        linksMemory.set(code, url); // sync mémoire aussi
+        console.log(`🔗 Supabase : ${BASE_URL}/r/${code} → ${url}`);
+        return res.status(201).json({ success: true, short: `${BASE_URL}/r/${code}` });
+      }
     }
-    return res.status(500).json({ success: false, error: 'Réponse TinyURL invalide' });
-  } catch(err) {
-    console.error('❌ Erreur TinyURL:', err.message);
-    return res.status(500).json({ success: false, error: 'Erreur lors du raccourcissement' });
+    // Si erreur Supabase → fallback mémoire ci-dessous
+    console.warn('⚠️  Table links absente de Supabase — fallback mémoire actif');
+  } catch(e) {
+    console.warn('⚠️  Supabase links indisponible — fallback mémoire actif');
   }
+
+  // ── Fallback mémoire (fonctionne jusqu'au prochain redémarrage) ──
+  const existingMem = [...linksMemory.entries()].find(([, v]) => v === url);
+  if (existingMem) {
+    return res.json({ success: true, short: `${BASE_URL}/r/${existingMem[0]}` });
+  }
+  let code = generateCode();
+  while (linksMemory.has(code)) code = generateCode();
+  linksMemory.set(code, url);
+  console.log(`🔗 Mémoire : ${BASE_URL}/r/${code} → ${url}`);
+  return res.status(201).json({ success: true, short: `${BASE_URL}/r/${code}` });
+});
+
+app.get('/r/:code', async (req, res) => {
+  // Essayer Supabase
+  try {
+    const { data, error } = await supabase
+      .from('links').select('url').eq('code', req.params.code).maybeSingle();
+    if (!error && data) return res.redirect(301, data.url);
+  } catch(e) {}
+
+  // Fallback mémoire
+  const memUrl = linksMemory.get(req.params.code);
+  if (memUrl) return res.redirect(301, memUrl);
+
+  return res.status(404).send('Lien introuvable.');
 });
 
 // ─── MESSAGES CONTACT ───
