@@ -1,8 +1,6 @@
 require('dotenv').config();
 const express = require('express');
 const axios   = require('axios');
-const fs      = require('fs');
-const path    = require('path');
 const stripe  = require('stripe')(process.env.STRIPE_SECRET_KEY);
 const { createClient } = require('@supabase/supabase-js');
 
@@ -402,20 +400,7 @@ app.post('/save-state', async (req, res) => {
   });
 });
 
-// ─── PERSISTANCE LIENS RACCOURCIS ───
-const LINKS_FILE = path.join(__dirname, 'links.json');
-
-function readLinks() {
-  try {
-    if (!fs.existsSync(LINKS_FILE)) return {};
-    return JSON.parse(fs.readFileSync(LINKS_FILE, 'utf8'));
-  } catch (e) { return {}; }
-}
-
-function writeLinks(links) {
-  fs.writeFileSync(LINKS_FILE, JSON.stringify(links, null, 2), 'utf8');
-}
-
+// ─── LIENS RACCOURCIS (Supabase — filesystem Render est éphémère) ───
 function generateCode() {
   const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
   let code = '';
@@ -423,33 +408,52 @@ function generateCode() {
   return code;
 }
 
-app.post('/shorten', (req, res) => {
+app.post('/shorten', async (req, res) => {
   const { url } = req.body;
   if (!url || !url.startsWith('http')) {
     return res.status(400).json({ success: false, error: 'URL invalide' });
   }
 
-  const links    = readLinks();
   const BASE_URL = process.env.BASE_URL || 'https://notelo-server.onrender.com';
-  const existing = Object.entries(links).find(([, data]) => data.url === url);
+
+  // Réutiliser un lien déjà raccourci pour la même URL
+  const { data: existing } = await supabase
+    .from('links')
+    .select('code')
+    .eq('url', url)
+    .maybeSingle();
 
   if (existing) {
-    return res.json({ success: true, short: `${BASE_URL}/r/${existing[0]}` });
+    return res.json({ success: true, short: `${BASE_URL}/r/${existing.code}` });
   }
 
+  // Générer un code unique
   let code;
-  do { code = generateCode(); } while (links[code]);
-  links[code] = { url, createdAt: new Date().toISOString() };
-  writeLinks(links);
+  for (let i = 0; i < 20; i++) {
+    const candidate = generateCode();
+    const { data: collision } = await supabase
+      .from('links').select('code').eq('code', candidate).maybeSingle();
+    if (!collision) { code = candidate; break; }
+  }
+  if (!code) return res.status(500).json({ success: false, error: 'Impossible de générer un code unique' });
+
+  const { error } = await supabase.from('links').insert({ code, url });
+  if (error) {
+    console.error('❌ Erreur Supabase links:', error.message);
+    return res.status(500).json({ success: false, error: 'Erreur base de données.' });
+  }
 
   console.log(`🔗 Raccourci : ${BASE_URL}/r/${code} → ${url}`);
   return res.status(201).json({ success: true, short: `${BASE_URL}/r/${code}` });
 });
 
-app.get('/r/:code', (req, res) => {
-  const links = readLinks();
-  const data  = links[req.params.code];
-  if (!data) return res.status(404).send('Lien introuvable ou expiré.');
+app.get('/r/:code', async (req, res) => {
+  const { data } = await supabase
+    .from('links')
+    .select('url')
+    .eq('code', req.params.code)
+    .maybeSingle();
+  if (!data) return res.status(404).send('Lien introuvable.');
   return res.redirect(301, data.url);
 });
 
