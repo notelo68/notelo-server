@@ -247,6 +247,102 @@ app.get('/bienvenue', (req, res) => {
   return res.redirect(`https://notelo.eu/bienvenue.html?plan=${req.query.plan || 'pro'}`);
 });
 
+// ─── POST /register — inscription essai gratuit 14 jours ───
+app.post('/register', async (req, res) => {
+  const { prenom, nom, entreprise, email: rawEmail, plan: rawPlan } = req.body;
+
+  if (!prenom || !rawEmail || !entreprise) {
+    return res.status(400).json({ success: false, error: 'Champs manquants.' });
+  }
+
+  const email = rawEmail.toLowerCase().trim();
+  const plan  = ['starter', 'pro', 'business'].includes(rawPlan) ? rawPlan : 'pro';
+
+  // Vérifier si déjà inscrit
+  const { data: existing } = await supabase
+    .from('clients')
+    .select('code')
+    .eq('email', email)
+    .maybeSingle();
+
+  if (existing) {
+    return res.status(409).json({ success: false, error: 'Un compte existe déjà avec cet email.' });
+  }
+
+  const code = generateClientCode();
+
+  const { error: insertErr } = await supabase.from('clients').insert({
+    email,
+    code,
+    plan,
+    role:        'trial',
+    nom:         prenom,
+    nom_pro:     entreprise,
+    lien_google: '',
+    join_date:   new Date().toISOString()
+  });
+
+  if (insertErr) {
+    console.error('❌ register insert:', insertErr.message);
+    return res.status(500).json({ success: false, error: 'Erreur base de données.' });
+  }
+
+  console.log(`✅ Essai : ${email} — ${plan} — code ${code}`);
+
+  const planLabels = {
+    starter:  { name: 'Starter',  limit: '50 SMS/mois'   },
+    pro:      { name: 'Pro',      limit: '200 SMS/mois'  },
+    business: { name: 'Business', limit: 'SMS illimités' }
+  };
+  const planInfo = planLabels[plan];
+
+  // Email de bienvenue (non bloquant)
+  axios.post('https://api.brevo.com/v3/smtp/email', {
+    sender: { name: 'Notelo', email: 'contact@notelo.eu' },
+    to:     [{ email, name: prenom }],
+    subject: `Bienvenue sur Notelo — vos accès d'essai`,
+    htmlContent: `
+      <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;max-width:600px;margin:auto;padding:32px;background:#fff">
+        <div style="text-align:center;margin-bottom:32px">
+          <span style="font-size:1.5rem;font-weight:700;color:#1A1A18">note<span style="color:#1D9E75">lo</span></span>
+        </div>
+        <h2 style="color:#1A1A18;font-size:22px;margin-bottom:8px">Bienvenue sur Notelo, ${escapeHtml(prenom)} !</h2>
+        <p style="color:#6B6B64;margin-bottom:24px">Votre essai gratuit de 14 jours est actif — plan <strong>${planInfo.name}</strong>, ${planInfo.limit}.</p>
+
+        <div style="background:#F9F7F3;border-radius:12px;padding:24px;margin-bottom:24px">
+          <p style="font-size:13px;color:#6B6B64;margin-bottom:12px;text-transform:uppercase;letter-spacing:0.05em;font-weight:600">Vos identifiants de connexion</p>
+          <table style="width:100%;border-collapse:collapse">
+            <tr>
+              <td style="padding:8px 0;color:#6B6B64;font-size:14px">Email</td>
+              <td style="padding:8px 0;font-weight:600;color:#1A1A18;font-size:14px">${escapeHtml(email)}</td>
+            </tr>
+            <tr>
+              <td style="padding:8px 0;color:#6B6B64;font-size:14px">Code d'accès</td>
+              <td style="padding:8px 0;font-weight:700;color:#1D9E75;font-size:18px;letter-spacing:0.05em">${code}</td>
+            </tr>
+          </table>
+        </div>
+
+        <a href="https://notelo.eu/login.html"
+           style="display:block;text-align:center;padding:14px 32px;background:#1D9E75;color:#fff;border-radius:100px;text-decoration:none;font-weight:600;font-size:15px;margin-bottom:24px">
+          Accéder à mon espace →
+        </a>
+
+        <p style="color:#6B6B64;font-size:13px;line-height:1.6">
+          Conservez ce code précieusement, il vous servira à chaque connexion.<br>
+          Des questions ? <a href="mailto:contact@notelo.eu" style="color:#1D9E75">contact@notelo.eu</a>
+        </p>
+      </div>
+    `
+  }, {
+    headers: { 'api-key': BREVO_API_KEY, 'Content-Type': 'application/json' }
+  })
+  .then(() => console.log(`📧 Email essai envoyé à ${email}`))
+  .catch(err => console.error('⚠️  Email essai échoué:', err.response?.data || err.message));
+
+  return res.status(201).json({ success: true, prenom, plan });
+});
+
 // ─── POST /create-portal-session ───
 app.post('/create-portal-session', async (req, res) => {
   const email = (req.body.email || '').toLowerCase().trim();
