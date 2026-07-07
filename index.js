@@ -38,11 +38,67 @@ const FIXED_ACCOUNTS = {
 const BREVO_API_KEY = process.env.BREVO_API_KEY;
 const BREVO_SENDER  = process.env.BREVO_SENDER || 'Notelo';
 
+// ─── ACCÈS TEST GRATUIT (10 SMS ou 14 jours, CB requise) ───
+const PRO_TRIAL_PRICE_ID = process.env.PRO_TRIAL_PRICE_ID || 'price_1TFLfOFrLrGfWhNdyILH5dpf';
+const TRIAL_SMS_LIMIT = 10;
+const TRIAL_DAYS = 14;
+
 function generateClientCode() {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
   let code = 'NOTELO-';
   for (let i = 0; i < 6; i++) code += chars[Math.floor(Math.random() * chars.length)];
   return code;
+}
+
+// ─── Email de rappel avant bascule automatique de l'accès test ───
+async function sendTrialReminderEmail(email, nom, reason) {
+  try {
+    await axios.post('https://api.brevo.com/v3/smtp/email', {
+      sender:  { name: 'Notelo', email: 'contact@notelo.eu' },
+      to:      [{ email, name: nom || '' }],
+      subject: `Votre accès test Notelo se termine bientôt`,
+      htmlContent: `
+        <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;max-width:600px;margin:auto;padding:32px;background:#fff">
+          <div style="text-align:center;margin-bottom:32px"><span style="font-size:1.5rem;font-weight:700;color:#1A1A18">note<span style="color:#1D9E75">lo</span></span></div>
+          <h2 style="color:#1A1A18;font-size:20px;margin-bottom:8px">Votre accès test se termine ${reason}</h2>
+          <p style="color:#6B6B64;margin-bottom:24px">Sauf résiliation de votre part, votre abonnement basculera automatiquement sur le plan <strong>Pro (49€/mois HT)</strong> et votre carte enregistrée sera débitée.</p>
+          <a href="https://notelo.eu/dashboard.html" style="display:block;text-align:center;padding:14px 32px;background:#1D9E75;color:#fff;border-radius:100px;text-decoration:none;font-weight:600;font-size:15px;margin-bottom:12px">Gérer mon abonnement →</a>
+          <p style="color:#9CA3AF;font-size:12px;text-align:center">Vous pouvez résilier à tout moment depuis votre dashboard, sans frais.</p>
+        </div>
+      `
+    }, { headers: { 'api-key': BREVO_API_KEY, 'Content-Type': 'application/json' } });
+    console.log(`📧 Email de rappel accès test envoyé à ${email}`);
+  } catch (err) {
+    console.error('❌ Erreur email rappel accès test:', err.response?.data || err.message);
+  }
+}
+
+// ─── Suivi des SMS envoyés pendant l'accès test — bascule anticipée à 10 SMS ───
+async function trackTrialSmsUsage(email) {
+  const { data: client } = await supabase
+    .from('clients')
+    .select('role, trial_sms_count, stripe_subscription_id, nom, trial_reminder_sent')
+    .eq('email', email)
+    .maybeSingle();
+
+  if (!client || client.role !== 'trial_cb') return;
+
+  const nextCount = (client.trial_sms_count || 0) + 1;
+  await supabase.from('clients').update({ trial_sms_count: nextCount }).eq('email', email);
+
+  if (nextCount === TRIAL_SMS_LIMIT - 2 && !client.trial_reminder_sent) {
+    await supabase.from('clients').update({ trial_reminder_sent: true }).eq('email', email);
+    sendTrialReminderEmail(email, client.nom, `dans ${TRIAL_SMS_LIMIT - nextCount} SMS`);
+  }
+
+  if (nextCount >= TRIAL_SMS_LIMIT && client.stripe_subscription_id) {
+    try {
+      await stripe.subscriptions.update(client.stripe_subscription_id, { trial_end: 'now' });
+      console.log(`💳 Bascule anticipée (10 SMS atteints) : ${email}`);
+    } catch (err) {
+      console.error('❌ Erreur bascule anticipée Stripe:', err.message);
+    }
+  }
 }
 
 // ─── STRIPE WEBHOOK (raw body — doit être AVANT express.json) ───
@@ -60,6 +116,83 @@ app.post('/webhook/stripe', express.raw({ type: 'application/json' }), async (re
   if (event.type === 'checkout.session.completed') {
     const session = event.data.object;
     const email   = (session.customer_email || session.customer_details?.email || '').toLowerCase();
+
+    // ─ Accès test gratuit (10 SMS / 14 jours, CB enregistrée, bascule auto vers Pro) ─
+    if (session.metadata?.type === 'trial_cb') {
+      const { prenom, entreprise } = session.metadata;
+      const subscription = await stripe.subscriptions.retrieve(session.subscription);
+
+      const { data: existing } = await supabase.from('clients').select('code').eq('email', email).maybeSingle();
+      let code = existing?.code;
+      if (!code) {
+        code = generateClientCode();
+        await supabase.from('clients').insert({
+          email,
+          code,
+          plan:                    'pro',
+          role:                    'trial_cb',
+          nom:                     prenom || '',
+          nom_pro:                 entreprise || '',
+          lien_google:             '',
+          join_date:               new Date().toISOString(),
+          stripe_customer_id:      session.customer,
+          stripe_subscription_id:  session.subscription,
+          trial_sms_count:         0,
+          trial_ends_at:           new Date(subscription.trial_end * 1000).toISOString(),
+        });
+        console.log(`✅ Accès test créé : ${email} — code ${code}`);
+      }
+
+      try {
+        await axios.post('https://api.brevo.com/v3/smtp/email', {
+          sender:      { name: 'Notelo', email: 'contact@notelo.eu' },
+          to:          [{ email, name: prenom || '' }],
+          subject:     `Bienvenue sur Notelo — votre accès test est actif`,
+          htmlContent: `
+            <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;max-width:600px;margin:auto;padding:32px;background:#fff">
+              <div style="text-align:center;margin-bottom:32px">
+                <span style="font-size:1.5rem;font-weight:700;color:#1A1A18">note<span style="color:#1D9E75">lo</span></span>
+              </div>
+              <h2 style="color:#1A1A18;font-size:22px;margin-bottom:8px">Bienvenue sur Notelo, ${escapeHtml(prenom || '')} !</h2>
+              <p style="color:#6B6B64;margin-bottom:24px">Votre accès test est actif — <strong>10 SMS gratuits</strong>, dans la limite de <strong>14 jours</strong>.</p>
+              <p style="color:#6B6B64;margin-bottom:24px">Sauf résiliation de votre part, votre abonnement basculera automatiquement sur le plan <strong>Pro (49€/mois HT)</strong> à la fin de l'accès test — votre carte enregistrée sera alors débitée. Vous pouvez résilier à tout moment depuis votre dashboard.</p>
+
+              <div style="background:#F9F7F3;border-radius:12px;padding:24px;margin-bottom:24px">
+                <p style="font-size:13px;color:#6B6B64;margin-bottom:12px;text-transform:uppercase;letter-spacing:0.05em;font-weight:600">Vos identifiants de connexion</p>
+                <table style="width:100%;border-collapse:collapse">
+                  <tr>
+                    <td style="padding:8px 0;color:#6B6B64;font-size:14px">Email</td>
+                    <td style="padding:8px 0;font-weight:600;color:#1A1A18;font-size:14px">${email}</td>
+                  </tr>
+                  <tr>
+                    <td style="padding:8px 0;color:#6B6B64;font-size:14px">Code d'accès</td>
+                    <td style="padding:8px 0;font-weight:700;color:#1D9E75;font-size:18px;letter-spacing:0.05em">${code}</td>
+                  </tr>
+                </table>
+              </div>
+
+              <a href="https://notelo.eu/login.html"
+                 style="display:block;text-align:center;padding:14px 32px;background:#1D9E75;color:#fff;border-radius:100px;text-decoration:none;font-weight:600;font-size:15px;margin-bottom:24px">
+                Accéder à mon espace →
+              </a>
+
+              <p style="color:#6B6B64;font-size:13px;line-height:1.6">
+                Conservez ce code précieusement, il vous servira à chaque connexion.<br>
+                Des questions ? <a href="mailto:contact@notelo.eu" style="color:#1D9E75">contact@notelo.eu</a>
+              </p>
+            </div>
+          `
+        }, {
+          headers: { 'api-key': BREVO_API_KEY, 'Content-Type': 'application/json' }
+        });
+        console.log(`📧 Email accès test envoyé à ${email}`);
+      } catch (err) {
+        console.error('❌ Erreur email Brevo (accès test):', err.response?.data || err.message);
+      }
+
+      return res.json({ received: true });
+    }
+
     const nom     = session.customer_details?.name || '';
     const amount  = session.amount_total;
 
@@ -142,6 +275,63 @@ app.post('/webhook/stripe', express.raw({ type: 'application/json' }), async (re
     }
   }
 
+  // ─ Bascule accès test → Pro payant (essai terminé, 1er prélèvement réussi) ─
+  if (event.type === 'customer.subscription.updated') {
+    const sub = event.data.object;
+    const previousStatus = event.data.previous_attributes?.status;
+
+    if (previousStatus === 'trialing' && sub.status === 'active') {
+      const { data: client } = await supabase.from('clients').select('email').eq('stripe_subscription_id', sub.id).maybeSingle();
+      if (client) {
+        await supabase.from('clients').update({ role: 'client' }).eq('email', client.email);
+        console.log(`💳 Bascule accès test → Pro payant : ${client.email}`);
+      }
+    }
+
+    if (sub.status === 'canceled') {
+      const { data: client } = await supabase.from('clients').select('email').eq('stripe_subscription_id', sub.id).maybeSingle();
+      if (client) {
+        await supabase.from('clients').update({ role: 'canceled' }).eq('email', client.email);
+        console.log(`🚫 Abonnement annulé : ${client.email}`);
+      }
+    }
+  }
+
+  // ─ Rappel avant bascule automatique (J-3, déclencheur "durée") ─
+  if (event.type === 'customer.subscription.trial_will_end') {
+    const sub = event.data.object;
+    const { data: client } = await supabase.from('clients').select('email, nom, trial_reminder_sent').eq('stripe_subscription_id', sub.id).maybeSingle();
+    if (client && !client.trial_reminder_sent) {
+      await supabase.from('clients').update({ trial_reminder_sent: true }).eq('email', client.email);
+      await sendTrialReminderEmail(client.email, client.nom, 'jours');
+    }
+  }
+
+  // ─ Échec de paiement à la bascule (carte refusée, etc.) ─
+  if (event.type === 'invoice.payment_failed') {
+    const invoice = event.data.object;
+    if (invoice.subscription) {
+      const { data: client } = await supabase.from('clients').select('email, nom').eq('stripe_subscription_id', invoice.subscription).maybeSingle();
+      if (client) {
+        console.warn(`⚠️  Échec de paiement à la bascule : ${client.email}`);
+        axios.post('https://api.brevo.com/v3/smtp/email', {
+          sender:  { name: 'Notelo', email: 'contact@notelo.eu' },
+          to:      [{ email: client.email, name: client.nom || '' }],
+          subject: `Action requise — le paiement de votre abonnement Notelo a échoué`,
+          htmlContent: `
+            <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;max-width:600px;margin:auto;padding:32px;background:#fff">
+              <div style="text-align:center;margin-bottom:32px"><span style="font-size:1.5rem;font-weight:700;color:#1A1A18">note<span style="color:#1D9E75">lo</span></span></div>
+              <h2 style="color:#1A1A18;font-size:20px;margin-bottom:8px">Le paiement de votre abonnement a échoué</h2>
+              <p style="color:#6B6B64;margin-bottom:24px">Votre accès test Notelo est terminé et le passage au plan Pro (49€/mois HT) n'a pas pu être débité sur votre carte. Merci de mettre à jour votre moyen de paiement pour conserver l'accès à votre compte.</p>
+              <a href="https://notelo.eu/dashboard.html" style="display:block;text-align:center;padding:14px 32px;background:#1D9E75;color:#fff;border-radius:100px;text-decoration:none;font-weight:600;font-size:15px">Mettre à jour ma carte →</a>
+            </div>
+          `
+        }, { headers: { 'api-key': BREVO_API_KEY, 'Content-Type': 'application/json' } })
+        .catch(err => console.error('❌ Erreur email échec paiement:', err.response?.data || err.message));
+      }
+    }
+  }
+
   res.json({ received: true });
 });
 
@@ -182,13 +372,15 @@ app.post('/auth', async (req, res) => {
   if (client) {
     return res.json({ success: true, client: {
       email,
-      code:       client.code,
-      plan:       client.plan,
-      role:       client.role,
-      nom:        client.nom,
-      nomPro:     client.nom_pro,
-      lienGoogle: client.lien_google,
-      joinDate:   client.join_date
+      code:          client.code,
+      plan:          client.plan,
+      role:          client.role,
+      nom:           client.nom,
+      nomPro:        client.nom_pro,
+      lienGoogle:    client.lien_google,
+      joinDate:      client.join_date,
+      trialSmsCount: client.trial_sms_count,
+      trialEndsAt:   client.trial_ends_at
     }});
   }
 
@@ -247,18 +439,16 @@ app.get('/bienvenue', (req, res) => {
   return res.redirect(`https://notelo.eu/bienvenue.html?plan=${req.query.plan || 'pro'}`);
 });
 
-// ─── POST /register — inscription essai gratuit 14 jours ───
-app.post('/register', async (req, res) => {
-  const { prenom, nom, entreprise, email: rawEmail, plan: rawPlan } = req.body;
+// ─── POST /create-trial-checkout — accès test gratuit (10 SMS ou 14 jours, CB requise) ───
+app.post('/create-trial-checkout', async (req, res) => {
+  const { prenom, nom, entreprise, email: rawEmail, tel } = req.body;
 
-  if (!prenom || !rawEmail || !entreprise) {
+  if (!prenom || !rawEmail || !entreprise || !tel) {
     return res.status(400).json({ success: false, error: 'Champs manquants.' });
   }
 
   const email = rawEmail.toLowerCase().trim();
-  const plan  = ['starter', 'pro', 'business'].includes(rawPlan) ? rawPlan : 'pro';
 
-  // Vérifier si déjà inscrit
   const { data: existing } = await supabase
     .from('clients')
     .select('code')
@@ -269,78 +459,27 @@ app.post('/register', async (req, res) => {
     return res.status(409).json({ success: false, error: 'Un compte existe déjà avec cet email.' });
   }
 
-  const code = generateClientCode();
+  try {
+    const session = await stripe.checkout.sessions.create({
+      mode:                     'subscription',
+      customer_email:          email,
+      line_items:               [{ price: PRO_TRIAL_PRICE_ID, quantity: 1 }],
+      payment_method_collection: 'always',
+      subscription_data: {
+        trial_period_days: TRIAL_DAYS,
+        trial_settings:    { end_behavior: { missing_payment_method: 'cancel' } },
+      },
+      metadata:    { type: 'trial_cb', prenom, nom: nom || '', entreprise, tel },
+      success_url: 'https://notelo.eu/bienvenue.html?plan=pro&trial=1',
+      cancel_url:  'https://notelo.eu/signup.html',
+    });
 
-  const { error: insertErr } = await supabase.from('clients').insert({
-    email,
-    code,
-    plan,
-    role:        'trial',
-    nom:         prenom,
-    nom_pro:     entreprise,
-    lien_google: '',
-    join_date:   new Date().toISOString()
-  });
-
-  if (insertErr) {
-    console.error('❌ register insert:', insertErr.message);
-    return res.status(500).json({ success: false, error: 'Erreur base de données.' });
+    console.log(`🔗 Session accès test créée pour ${email}`);
+    return res.json({ success: true, url: session.url });
+  } catch (err) {
+    console.error('❌ Erreur création session accès test:', err.message);
+    return res.status(500).json({ success: false, error: 'Erreur lors de la création de la session de paiement.' });
   }
-
-  console.log(`✅ Essai : ${email} — ${plan} — code ${code}`);
-
-  const planLabels = {
-    starter:  { name: 'Starter',  limit: '50 SMS/mois'   },
-    pro:      { name: 'Pro',      limit: '200 SMS/mois'  },
-    business: { name: 'Business', limit: 'SMS illimités' }
-  };
-  const planInfo = planLabels[plan];
-
-  // Email de bienvenue (non bloquant)
-  axios.post('https://api.brevo.com/v3/smtp/email', {
-    sender: { name: 'Notelo', email: 'contact@notelo.eu' },
-    to:     [{ email, name: prenom }],
-    subject: `Bienvenue sur Notelo — vos accès d'essai`,
-    htmlContent: `
-      <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;max-width:600px;margin:auto;padding:32px;background:#fff">
-        <div style="text-align:center;margin-bottom:32px">
-          <span style="font-size:1.5rem;font-weight:700;color:#1A1A18">note<span style="color:#1D9E75">lo</span></span>
-        </div>
-        <h2 style="color:#1A1A18;font-size:22px;margin-bottom:8px">Bienvenue sur Notelo, ${escapeHtml(prenom)} !</h2>
-        <p style="color:#6B6B64;margin-bottom:24px">Votre essai gratuit de 14 jours est actif — plan <strong>${planInfo.name}</strong>, ${planInfo.limit}.</p>
-
-        <div style="background:#F9F7F3;border-radius:12px;padding:24px;margin-bottom:24px">
-          <p style="font-size:13px;color:#6B6B64;margin-bottom:12px;text-transform:uppercase;letter-spacing:0.05em;font-weight:600">Vos identifiants de connexion</p>
-          <table style="width:100%;border-collapse:collapse">
-            <tr>
-              <td style="padding:8px 0;color:#6B6B64;font-size:14px">Email</td>
-              <td style="padding:8px 0;font-weight:600;color:#1A1A18;font-size:14px">${escapeHtml(email)}</td>
-            </tr>
-            <tr>
-              <td style="padding:8px 0;color:#6B6B64;font-size:14px">Code d'accès</td>
-              <td style="padding:8px 0;font-weight:700;color:#1D9E75;font-size:18px;letter-spacing:0.05em">${code}</td>
-            </tr>
-          </table>
-        </div>
-
-        <a href="https://notelo.eu/login.html"
-           style="display:block;text-align:center;padding:14px 32px;background:#1D9E75;color:#fff;border-radius:100px;text-decoration:none;font-weight:600;font-size:15px;margin-bottom:24px">
-          Accéder à mon espace →
-        </a>
-
-        <p style="color:#6B6B64;font-size:13px;line-height:1.6">
-          Conservez ce code précieusement, il vous servira à chaque connexion.<br>
-          Des questions ? <a href="mailto:contact@notelo.eu" style="color:#1D9E75">contact@notelo.eu</a>
-        </p>
-      </div>
-    `
-  }, {
-    headers: { 'api-key': BREVO_API_KEY, 'Content-Type': 'application/json' }
-  })
-  .then(() => console.log(`📧 Email essai envoyé à ${email}`))
-  .catch(err => console.error('⚠️  Email essai échoué:', err.response?.data || err.message));
-
-  return res.status(201).json({ success: true, prenom, plan });
 });
 
 // ─── POST /create-portal-session ───
@@ -688,7 +827,7 @@ app.get('/messages', async (req, res) => {
 
 // ─── POST /send-sms ───
 app.post('/send-sms', async (req, res) => {
-  const { prenom, telephone, nomPro, lienGoogle, message: messageOverride } = req.body;
+  const { prenom, telephone, nomPro, lienGoogle, message: messageOverride, email: accountEmail } = req.body;
 
   if (!prenom || !telephone || !nomPro || !lienGoogle) {
     return res.status(400).json({
@@ -707,6 +846,11 @@ app.post('/send-sms', async (req, res) => {
     );
 
     console.log(`✅ SMS envoyé à ${telephone}`);
+
+    if (accountEmail) {
+      trackTrialSmsUsage(accountEmail.toLowerCase().trim()).catch(err => console.error('❌ Erreur suivi accès test:', err.message));
+    }
+
     return res.status(200).json({ success: true, message: 'SMS envoyé avec succès.', messageId: result.data.messageId });
 
   } catch (err) {
