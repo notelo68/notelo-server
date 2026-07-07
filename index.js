@@ -73,6 +73,28 @@ async function sendTrialReminderEmail(email, nom, reason) {
   }
 }
 
+// ─── Email de confirmation d'annulation d'abonnement ───
+async function sendCancellationEmail(email, nom) {
+  try {
+    await axios.post('https://api.brevo.com/v3/smtp/email', {
+      sender:  { name: 'Notelo', email: 'contact@notelo.eu' },
+      to:      [{ email, name: nom || '' }],
+      subject: `Votre abonnement Notelo a bien été annulé`,
+      htmlContent: `
+        <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;max-width:600px;margin:auto;padding:32px;background:#fff">
+          <div style="text-align:center;margin-bottom:32px"><span style="font-size:1.5rem;font-weight:700;color:#1A1A18">note<span style="color:#1D9E75">lo</span></span></div>
+          <h2 style="color:#1A1A18;font-size:20px;margin-bottom:8px">Votre abonnement a bien été annulé</h2>
+          <p style="color:#6B6B64;margin-bottom:24px">Aucun prélèvement ne sera effectué. Vous pouvez réactiver votre compte à tout moment en souscrivant à nouveau depuis notelo.eu.</p>
+          <a href="https://notelo.eu" style="display:block;text-align:center;padding:14px 32px;background:#1D9E75;color:#fff;border-radius:100px;text-decoration:none;font-weight:600;font-size:15px">Revenir sur notelo.eu →</a>
+        </div>
+      `
+    }, { headers: { 'api-key': BREVO_API_KEY, 'Content-Type': 'application/json' } });
+    console.log(`📧 Email confirmation annulation envoyé à ${email}`);
+  } catch (err) {
+    console.error('❌ Erreur email confirmation annulation:', err.response?.data || err.message);
+  }
+}
+
 // ─── Suivi des SMS envoyés pendant l'accès test — bascule anticipée à 10 SMS ───
 async function trackTrialSmsUsage(email) {
   const { data: client } = await supabase
@@ -289,11 +311,23 @@ app.post('/webhook/stripe', express.raw({ type: 'application/json' }), async (re
     }
 
     if (sub.status === 'canceled') {
-      const { data: client } = await supabase.from('clients').select('email').eq('stripe_subscription_id', sub.id).maybeSingle();
+      const { data: client } = await supabase.from('clients').select('email, nom').eq('stripe_subscription_id', sub.id).maybeSingle();
       if (client) {
         await supabase.from('clients').update({ role: 'canceled' }).eq('email', client.email);
         console.log(`🚫 Abonnement annulé : ${client.email}`);
+        sendCancellationEmail(client.email, client.nom);
       }
+    }
+  }
+
+  // ─ Confirmation d'annulation définitive (période de facturation arrivée à son terme) ─
+  if (event.type === 'customer.subscription.deleted') {
+    const sub = event.data.object;
+    const { data: client } = await supabase.from('clients').select('email, nom, role').eq('stripe_subscription_id', sub.id).maybeSingle();
+    if (client && client.role !== 'canceled') {
+      await supabase.from('clients').update({ role: 'canceled' }).eq('email', client.email);
+      console.log(`🚫 Abonnement supprimé : ${client.email}`);
+      sendCancellationEmail(client.email, client.nom);
     }
   }
 
@@ -837,6 +871,21 @@ app.post('/send-sms', async (req, res) => {
   }
 
   const message = messageOverride || `Bonjour ${prenom}, merci pour votre visite chez ${nomPro} ! Votre avis en 30 secondes nous ferait plaisir : ${lienGoogle} STOP SMS`;
+
+  if (accountEmail) {
+    const { data: client } = await supabase
+      .from('clients')
+      .select('role, trial_sms_count')
+      .eq('email', accountEmail.toLowerCase().trim())
+      .maybeSingle();
+
+    if (client && client.role === 'trial_cb' && (client.trial_sms_count || 0) >= TRIAL_SMS_LIMIT) {
+      return res.status(403).json({
+        success: false,
+        error: "Accès test terminé (10 SMS atteints) — votre abonnement Pro est en cours d'activation."
+      });
+    }
+  }
 
   try {
     const result = await axios.post(
