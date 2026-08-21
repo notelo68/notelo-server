@@ -43,6 +43,83 @@ const PRO_TRIAL_PRICE_ID = process.env.PRO_TRIAL_PRICE_ID || 'price_1U4NfJFrLrGf
 const TRIAL_SMS_LIMIT = 10;
 const TRIAL_DAYS = 14;
 
+// ─── QUOTAS MENSUELS PAR PLAN (doivent rester alignés avec planLabels ci-dessous) ───
+const PLAN_LIMITS = { starter: 50, pro: 200, business: 750 };
+
+// ─── HEURE LÉGALE (CNIL / art. L.34-5 CPCE) — calculée en heure de Paris, indépendamment du fuseau du serveur ───
+function getParisNow() {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'Europe/Paris', hour12: false, weekday: 'short',
+    year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit'
+  }).formatToParts(new Date());
+  const map = {};
+  for (const p of parts) map[p.type] = p.value;
+  const weekdayMap = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
+  return {
+    date:    new Date(parseInt(map.year, 10), parseInt(map.month, 10) - 1, parseInt(map.day, 10)),
+    weekday: weekdayMap[map.weekday],
+    hour:    parseInt(map.hour, 10) % 24, // Intl peut renvoyer "24" à minuit
+    monthKey: `${map.year}-${map.month}`,
+  };
+}
+
+// ─── JOURS FÉRIÉS FRANCE (Alsace-Moselle incluse — même logique que dashboard.html) ───
+function getEasterDate(year) {
+  const a = year % 19;
+  const b = Math.floor(year / 100);
+  const c = year % 100;
+  const d = Math.floor(b / 4);
+  const e = b % 4;
+  const f = Math.floor((b + 8) / 25);
+  const g = Math.floor((b - f + 1) / 3);
+  const h = (19 * a + b - d - g + 15) % 30;
+  const i = Math.floor(c / 4);
+  const k = c % 4;
+  const l = (32 + 2 * e + 2 * i - h - k) % 7;
+  const m = Math.floor((a + 11 * h + 22 * l) / 451);
+  const month = Math.floor((h + l - 7 * m + 114) / 31);
+  const day = ((h + l - 7 * m + 114) % 31) + 1;
+  return new Date(year, month - 1, day);
+}
+
+function getJourFerie(date) {
+  const year = date.getFullYear();
+  const paques = getEasterDate(year);
+  const add = (d, n) => { const r = new Date(d); r.setDate(r.getDate() + n); return r; };
+  const key = d => String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+
+  const feries = {
+    '01-01': "Jour de l'An", '05-01': 'Fête du Travail', '05-08': 'Victoire 1945',
+    '07-14': 'Fête Nationale', '08-15': 'Assomption', '11-01': 'Toussaint',
+    '11-11': 'Armistice 1918', '12-25': 'Noël',
+    [key(add(paques, -2))]: 'Vendredi Saint',
+    [key(add(paques, 1))]: 'Lundi de Pâques',
+    [key(add(paques, 39))]: 'Ascension',
+    [key(add(paques, 50))]: 'Lundi de Pentecôte',
+    '12-26': 'Saint-Étienne',
+  };
+
+  return feries[key(date)] || null;
+}
+
+// ─── Suivi authoritatif du quota mensuel (paiement) — incrémenté uniquement depuis /send-sms après envoi réussi ───
+async function incrementMonthlyUsage(email, monthKey) {
+  const { data: state } = await supabase
+    .from('user_states')
+    .select('sent_this_month, sent_month')
+    .eq('email', email)
+    .maybeSingle();
+
+  const current = (state && state.sent_month === monthKey) ? (state.sent_this_month || 0) : 0;
+
+  await supabase.from('user_states').upsert({
+    email,
+    sent_this_month: current + 1,
+    sent_month:      monthKey,
+    updated_at:      new Date().toISOString(),
+  }, { onConflict: 'email' });
+}
+
 function generateClientCode() {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
   let code = 'NOTELO-';
@@ -575,7 +652,7 @@ app.get('/load-state', async (req, res) => {
 app.post('/save-state', async (req, res) => {
   const {
     email,
-    sentThisMonth, sentMonth, smsTemplate, useCustomTemplate, nomPro, lienGoogle,
+    smsTemplate, useCustomTemplate, nomPro, lienGoogle,
     history,
     lockEnabled, newPin, currentPin,
   } = req.body;
@@ -639,10 +716,12 @@ app.post('/save-state', async (req, res) => {
     nextHistory = history.slice(0, HISTORY_CAP);
   }
 
+  // sent_this_month / sent_month : authoritatifs côté serveur (incrémentés uniquement par /send-sms),
+  // jamais acceptés depuis le client pour empêcher une remise à zéro du quota falsifiée.
   const payload = {
     email:               e,
-    sent_this_month:     sentThisMonth ?? current?.sent_this_month ?? 0,
-    sent_month:          sentMonth ?? current?.sent_month ?? null,
+    sent_this_month:     current?.sent_this_month ?? 0,
+    sent_month:          current?.sent_month ?? null,
     sms_template:        smsTemplate ?? current?.sms_template ?? null,
     use_custom_template: useCustomTemplate ?? current?.use_custom_template ?? false,
     nom_pro:             nomPro ?? current?.nom_pro ?? null,
@@ -861,7 +940,7 @@ app.get('/messages', async (req, res) => {
 
 // ─── POST /send-sms ───
 app.post('/send-sms', async (req, res) => {
-  const { prenom, telephone, nomPro, lienGoogle, message: messageOverride, email: accountEmail } = req.body;
+  const { prenom, telephone, nomPro, lienGoogle, message: messageOverride, email: emailRaw } = req.body;
 
   if (!prenom || !telephone || !nomPro || !lienGoogle) {
     return res.status(400).json({
@@ -870,22 +949,72 @@ app.post('/send-sms', async (req, res) => {
     });
   }
 
-  const message = messageOverride || `Bonjour ${prenom}, merci pour votre visite chez ${nomPro} ! Votre avis en 30 secondes nous ferait plaisir : ${lienGoogle} STOP SMS`;
+  const accountEmail = (emailRaw || '').toLowerCase().trim();
+  if (!accountEmail) {
+    return res.status(400).json({ success: false, error: 'Compte requis pour envoyer un SMS.' });
+  }
 
-  if (accountEmail) {
+  let account = FIXED_ACCOUNTS[accountEmail]
+    ? { role: FIXED_ACCOUNTS[accountEmail].role, plan: FIXED_ACCOUNTS[accountEmail].plan, trial_sms_count: 0 }
+    : null;
+
+  if (!account) {
     const { data: client } = await supabase
       .from('clients')
-      .select('role, trial_sms_count')
-      .eq('email', accountEmail.toLowerCase().trim())
+      .select('role, plan, trial_sms_count')
+      .eq('email', accountEmail)
       .maybeSingle();
+    account = client;
+  }
 
-    if (client && client.role === 'trial_cb' && (client.trial_sms_count || 0) >= TRIAL_SMS_LIMIT) {
-      return res.status(403).json({
-        success: false,
-        error: "Accès test terminé (10 SMS atteints) — votre abonnement Pro est en cours d'activation."
-      });
+  if (!account) {
+    return res.status(403).json({ success: false, error: 'Compte introuvable.' });
+  }
+
+  const isAdmin = account.role === 'admin';
+
+  if (account.role === 'canceled') {
+    return res.status(403).json({ success: false, error: 'Abonnement résilié — réabonnez-vous pour continuer à envoyer des SMS.' });
+  }
+
+  if (account.role === 'trial_cb' && (account.trial_sms_count || 0) >= TRIAL_SMS_LIMIT) {
+    return res.status(403).json({
+      success: false,
+      error: "Accès test terminé (10 SMS atteints) — votre abonnement Pro est en cours d'activation."
+    });
+  }
+
+  const { date: parisDate, weekday, hour, monthKey } = getParisNow();
+
+  // ─── Horaires légaux (CNIL / art. L.34-5 CPCE) — admin exempté, comme côté dashboard ───
+  if (!isAdmin) {
+    const ferie = getJourFerie(parisDate);
+    if (weekday === 0) {
+      return res.status(403).json({ success: false, error: 'Envoi interdit le dimanche (CNIL) — réessayez lundi.' });
+    }
+    if (ferie) {
+      return res.status(403).json({ success: false, error: `Envoi impossible aujourd'hui — ${ferie} (jour férié).` });
+    }
+    if (hour < 8 || hour >= 20) {
+      return res.status(403).json({ success: false, error: 'Envoi autorisé entre 8h et 20h uniquement (CNIL).' });
     }
   }
+
+  // ─── Quota mensuel du plan — admin et accès test exemptés (l'accès test a sa propre limite ci-dessus) ───
+  if (!isAdmin && account.role !== 'trial_cb') {
+    const limit = PLAN_LIMITS[account.plan] ?? PLAN_LIMITS.business;
+    const { data: state } = await supabase
+      .from('user_states')
+      .select('sent_this_month, sent_month')
+      .eq('email', accountEmail)
+      .maybeSingle();
+    const currentCount = (state && state.sent_month === monthKey) ? (state.sent_this_month || 0) : 0;
+    if (currentCount >= limit) {
+      return res.status(403).json({ success: false, error: 'Quota mensuel atteint — passez au plan supérieur.' });
+    }
+  }
+
+  const message = messageOverride || `Bonjour ${prenom}, merci pour votre visite chez ${nomPro} ! Votre avis en 30 secondes nous ferait plaisir : ${lienGoogle} STOP SMS`;
 
   try {
     const result = await axios.post(
@@ -896,8 +1025,10 @@ app.post('/send-sms', async (req, res) => {
 
     console.log(`✅ SMS envoyé à ${telephone}`);
 
-    if (accountEmail) {
-      trackTrialSmsUsage(accountEmail.toLowerCase().trim()).catch(err => console.error('❌ Erreur suivi accès test:', err.message));
+    if (account.role === 'trial_cb') {
+      trackTrialSmsUsage(accountEmail).catch(err => console.error('❌ Erreur suivi accès test:', err.message));
+    } else if (!isAdmin) {
+      incrementMonthlyUsage(accountEmail, monthKey).catch(err => console.error('❌ Erreur suivi quota mensuel:', err.message));
     }
 
     return res.status(200).json({ success: true, message: 'SMS envoyé avec succès.', messageId: result.data.messageId });
