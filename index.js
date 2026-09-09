@@ -44,7 +44,7 @@ const TRIAL_SMS_LIMIT = 10;
 const TRIAL_DAYS = 14;
 
 // ─── QUOTAS MENSUELS PAR PLAN (doivent rester alignés avec planLabels ci-dessous) ───
-const PLAN_LIMITS = { starter: 50, pro: 200, business: 750 };
+const PLAN_LIMITS = { starter: 20, pro: 200, business: 750 };
 
 // ─── HEURE LÉGALE (CNIL / art. L.34-5 CPCE) — calculée en heure de Paris, indépendamment du fuseau du serveur ───
 function getParisNow() {
@@ -297,7 +297,7 @@ app.post('/webhook/stripe', express.raw({ type: 'application/json' }), async (re
 
     const planKey = amount <= 5900 ? 'starter' : amount <= 8900 ? 'pro' : 'business';
     const planLabels = {
-      starter:  { name: 'Starter',  limit: '50 SMS/mois',   price: '59€/mois' },
+      starter:  { name: 'Starter',  limit: '20 SMS/mois',   price: '59€/mois' },
       pro:      { name: 'Pro',      limit: '200 SMS/mois',  price: '89€/mois' },
       business: { name: 'Business', limit: '750 SMS/mois', price: '179€/mois' }
     };
