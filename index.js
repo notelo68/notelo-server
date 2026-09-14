@@ -39,7 +39,7 @@ const BREVO_API_KEY = process.env.BREVO_API_KEY;
 const BREVO_SENDER  = process.env.BREVO_SENDER || 'Notelo';
 
 // ─── ACCÈS TEST GRATUIT (10 SMS ou 14 jours, CB requise) ───
-const PRO_TRIAL_PRICE_ID = process.env.PRO_TRIAL_PRICE_ID || 'price_1U4NfJFrLrGfWhNdbzTwd3BA';
+const PRO_TRIAL_PRICE_ID = process.env.PRO_TRIAL_PRICE_ID || 'price_1UFYW6FrLrGfWhNdFzYWZETS';
 const TRIAL_SMS_LIMIT = 10;
 const TRIAL_DAYS = 14;
 
@@ -138,7 +138,7 @@ async function sendTrialReminderEmail(email, nom, reason) {
         <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;max-width:600px;margin:auto;padding:32px;background:#fff">
           <div style="text-align:center;margin-bottom:32px"><span style="font-size:1.5rem;font-weight:700;color:#1A1A18">note<span style="color:#1D9E75">lo</span></span></div>
           <h2 style="color:#1A1A18;font-size:20px;margin-bottom:8px">Votre accès test se termine ${reason}</h2>
-          <p style="color:#6B6B64;margin-bottom:24px">Sauf résiliation de votre part, votre abonnement basculera automatiquement sur le plan <strong>Pro (89€/mois HT)</strong> et votre carte enregistrée sera débitée.</p>
+          <p style="color:#6B6B64;margin-bottom:24px">Sauf résiliation de votre part, votre abonnement basculera automatiquement sur le plan <strong>Pro (99€/mois HT)</strong> et votre carte enregistrée sera débitée.</p>
           <a href="https://notelo.eu/dashboard.html" style="display:block;text-align:center;padding:14px 32px;background:#1D9E75;color:#fff;border-radius:100px;text-decoration:none;font-weight:600;font-size:15px;margin-bottom:12px">Gérer mon abonnement →</a>
           <p style="color:#9CA3AF;font-size:12px;text-align:center">Vous pouvez résilier à tout moment depuis votre dashboard, sans frais.</p>
         </div>
@@ -254,7 +254,7 @@ app.post('/webhook/stripe', express.raw({ type: 'application/json' }), async (re
               </div>
               <h2 style="color:#1A1A18;font-size:22px;margin-bottom:8px">Bienvenue sur Notelo, ${escapeHtml(prenom || '')} !</h2>
               <p style="color:#6B6B64;margin-bottom:24px">Votre accès test est actif — <strong>10 SMS gratuits</strong>, dans la limite de <strong>14 jours</strong>.</p>
-              <p style="color:#6B6B64;margin-bottom:24px">Sauf résiliation de votre part, votre abonnement basculera automatiquement sur le plan <strong>Pro (89€/mois HT)</strong> à la fin de l'accès test — votre carte enregistrée sera alors débitée. Vous pouvez résilier à tout moment depuis votre dashboard.</p>
+              <p style="color:#6B6B64;margin-bottom:24px">Sauf résiliation de votre part, votre abonnement basculera automatiquement sur le plan <strong>Pro (99€/mois HT)</strong> à la fin de l'accès test — votre carte enregistrée sera alors débitée. Vous pouvez résilier à tout moment depuis votre dashboard.</p>
 
               <div style="background:#F9F7F3;border-radius:12px;padding:24px;margin-bottom:24px">
                 <p style="font-size:13px;color:#6B6B64;margin-bottom:12px;text-transform:uppercase;letter-spacing:0.05em;font-weight:600">Vos identifiants de connexion</p>
@@ -295,11 +295,11 @@ app.post('/webhook/stripe', express.raw({ type: 'application/json' }), async (re
     const nom     = session.customer_details?.name || '';
     const amount  = session.amount_total;
 
-    const planKey = amount <= 5900 ? 'starter' : amount <= 8900 ? 'pro' : 'business';
+    const planKey = amount <= 6900 ? 'starter' : amount <= 9900 ? 'pro' : 'business';
     const planLabels = {
-      starter:  { name: 'Starter',  limit: '20 SMS/mois',   price: '59€/mois' },
-      pro:      { name: 'Pro',      limit: '200 SMS/mois',  price: '89€/mois' },
-      business: { name: 'Business', limit: '750 SMS/mois', price: '179€/mois' }
+      starter:  { name: 'Starter',  limit: '20 SMS/mois',   price: '69€/mois' },
+      pro:      { name: 'Pro',      limit: '200 SMS/mois',  price: '99€/mois' },
+      business: { name: 'Business', limit: '750 SMS/mois', price: '199€/mois' }
     };
     const plan = planLabels[planKey];
 
@@ -433,7 +433,7 @@ app.post('/webhook/stripe', express.raw({ type: 'application/json' }), async (re
             <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;max-width:600px;margin:auto;padding:32px;background:#fff">
               <div style="text-align:center;margin-bottom:32px"><span style="font-size:1.5rem;font-weight:700;color:#1A1A18">note<span style="color:#1D9E75">lo</span></span></div>
               <h2 style="color:#1A1A18;font-size:20px;margin-bottom:8px">Le paiement de votre abonnement a échoué</h2>
-              <p style="color:#6B6B64;margin-bottom:24px">Votre accès test Notelo est terminé et le passage au plan Pro (89€/mois HT) n'a pas pu être débité sur votre carte. Merci de mettre à jour votre moyen de paiement pour conserver l'accès à votre compte.</p>
+              <p style="color:#6B6B64;margin-bottom:24px">Votre accès test Notelo est terminé et le passage au plan Pro (99€/mois HT) n'a pas pu être débité sur votre carte. Merci de mettre à jour votre moyen de paiement pour conserver l'accès à votre compte.</p>
               <a href="https://notelo.eu/dashboard.html" style="display:block;text-align:center;padding:14px 32px;background:#1D9E75;color:#fff;border-radius:100px;text-decoration:none;font-weight:600;font-size:15px">Mettre à jour ma carte →</a>
             </div>
           `
