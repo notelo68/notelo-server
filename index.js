@@ -316,14 +316,21 @@ app.post('/webhook/stripe', express.raw({ type: 'application/json' }), async (re
       await supabase.from('clients').insert({
         email,
         code,
-        plan:        planKey,
-        role:        'client',
-        nom:         nom.split(' ')[0] || '',
-        nom_pro:     '',
-        lien_google: '',
-        join_date:   new Date().toISOString()
+        plan:                   planKey,
+        role:                   'client',
+        nom:                    nom.split(' ')[0] || '',
+        nom_pro:                '',
+        lien_google:            '',
+        join_date:              new Date().toISOString(),
+        stripe_customer_id:     session.customer,
+        stripe_subscription_id: session.subscription
       });
       console.log(`✅ Nouveau client créé : ${email} — code ${code} — plan ${planKey}`);
+    } else {
+      await supabase.from('clients').update({
+        stripe_customer_id:     session.customer,
+        stripe_subscription_id: session.subscription
+      }).eq('email', email);
     }
 
     // Email de bienvenue avec identifiants
